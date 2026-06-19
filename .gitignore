@@ -1,0 +1,11 @@
+# Regenerable binary data (deterministic from generate_data.py / build_features.py)
+data/tables/
+features/feature_table.parquet
+
+# Build intermediates
+article/*.html
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

@@ -24,10 +24,10 @@ leak traps (`ip_geo` ≈ the answer, self-reported `raw_city_text`, region-joine
 
 ## How to use it
 
-In normal use you type **two chat prompts** in Claude Code — the skills run their
-scripts for you and hand back the report. You don't type python; the human only
-**confirms the wiring** and **sets the keep threshold**. The loop:
-**ideate → materialize → validate → (loop back)**.
+In normal use the workflow is **two prompts** in the Claude Code chat: the skills
+run their scripts and return the report. The only manual steps are the two
+judgment gates — **confirming the data wiring** and **setting the keep
+threshold**. The loop is **ideate → materialize → validate → (loop back)**.
 
 ### Setup (once)
 
@@ -45,27 +45,27 @@ pip install pandas scikit-learn scipy matplotlib pyarrow      # + "pyspark[conne
 export SPARK_REMOTE=sc://YOUR-HOST:15002                       # Spark only: your Connect endpoint
 ```
 
-### Use it — just chat
+### The workflow
 
-**1 · Ideate** — point it at your tables (catalog names, or `s3://…` / `hdfs://…` paths):
+**1 · Ideate** — point the skill at your tables (catalog names, or `s3://…` / `hdfs://…` paths):
 
 > `/ideate-features predict home_city for person_id; tables warehouse.messages warehouse.people warehouse.home_city warehouse.tower_pings …`
 
-Claude profiles them on a cluster-side sample, proposes the wiring, **you confirm**, and it writes the backlog.
+Claude profiles them on a cluster-side sample, proposes the wiring for your confirmation, then writes the backlog.
 
-**2 · Materialize** — there is no skill for this (the feature logic is specific to *your* tables), so just ask:
+**2 · Materialize** — this step has no dedicated skill, since the feature logic is specific to your tables. Ask Claude to build it:
 
 > `materialize the kept backlog rows into a feature table`
 
-Claude writes and runs the feature code — **you review the leakage-safe parts** — and writes a feature table to the catalog / S3 / HDFS (Spark) or local parquet. [`build_features_spark.py`](features/build_features_spark.py) is the template.
+Claude writes and runs the feature code — which you review for the leakage-safe parts — and writes the table to the catalog, S3, or HDFS (on Spark), or to local parquet. [`build_features_spark.py`](features/build_features_spark.py) is the template.
 
 **3 · Validate** — screen it:
 
 > `/validate-signal screen warehouse.home_city_features vs warehouse.home_city — id person_id, label home_city`
 
-Claude runs the harness and hands you **`validation/report.md`** + `validation/figures/` (the analysis lands wherever `--out` points; on Spark it's written to the driver, not back to S3/HDFS).
+Claude runs the harness and returns **`validation/report.md`** plus `validation/figures/`. The analysis is written wherever `--out` points; on Spark that is the driver, not back to S3/HDFS.
 
-The human is at **two gates only**: confirm the wiring (step 1) and set the keep threshold / rule on the flagged features (step 3).
+The human is at **two gates only**: confirm the wiring (step 1), and set the keep threshold and adjudicate the flagged features (step 3).
 
 > **In-notebook (non-Connect) `spark`?** A script Claude launches is a separate
 > process and can't attach to your kernel's session — expose a Spark Connect
@@ -75,8 +75,8 @@ The human is at **two gates only**: confirm the wiring (step 1) and set the keep
 <details>
 <summary><b>Reproduce the bundled demo without installing the skills (raw scripts)</b></summary>
 
-The skills just run these for you. `generate_data.py` is demo scaffolding only —
-in real use your tables already exist, so you start at *ideate*.
+The skills run these for you. `generate_data.py` is demo scaffolding only — in
+real use your tables already exist, so you start at *ideate*.
 
 ```bash
 pip install pandas numpy scikit-learn scipy matplotlib pyarrow
@@ -105,7 +105,7 @@ a score; here the high-cardinality leak columns (`ip_city`, `declared_city`)
 importances" gives a misleadingly hopeless 0.091. The aggregate model score lies
 in both directions; the **per-feature screen** tells the truth and says what to cut.
 
-**What the harness did, with the human only confirming wiring and ruling on flags:**
+**What the harness did — the human only confirmed the wiring and adjudicated the flags:**
 
 - **Found the signal feature-by-feature** even though the all-features model failed:
   MI ranks `nb_modal_city` (2.61), `merch_modal_city` (2.49), `ip_city` (2.21),

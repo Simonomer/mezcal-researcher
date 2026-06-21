@@ -58,6 +58,30 @@ def get_spark(remote):
     return b.getOrCreate()
 
 
+def _looks_like_path(ref):
+    return ("://" in ref or ref.startswith(("/", "dbfs:", "file:"))
+            or ref.endswith((".parquet", ".csv", ".tsv", ".json")) or "*" in ref)
+
+
+def spark_read(spark, ref, fmt=None):
+    """Read a catalog table OR a path on HDFS / S3 / S3A / GCS / DBFS / local.
+
+    Paths (anything with a scheme, leading slash, glob, or data extension) are
+    read with spark.read.<format>; everything else is treated as a catalog
+    table. Format is inferred from the extension unless --format is given.
+    """
+    if not _looks_like_path(ref):
+        return spark.table(ref)
+    if fmt is None:
+        fmt = ("csv" if ref.endswith((".csv", ".tsv")) else
+               "json" if ref.endswith(".json") else "parquet")
+    reader = spark.read
+    if fmt == "csv":
+        sep = "\t" if ref.endswith(".tsv") else ","
+        reader = reader.option("header", True).option("inferSchema", True).option("sep", sep)
+    return reader.format(fmt).load(ref)
+
+
 def load_frame(args):
     """Return one pandas df with id + label (+ time) + feature columns."""
     if args.features_file:
@@ -72,8 +96,8 @@ def load_frame(args):
 
     spark = get_spark(args.remote)
     from pyspark.sql import functions as F
-    feats = spark.table(args.features_table)
-    labels = spark.table(args.labels_table).select(args.id_col, args.label_col)
+    feats = spark_read(spark, args.features_table, args.format)
+    labels = spark_read(spark, args.labels_table, args.format).select(args.id_col, args.label_col)
     joined = feats.join(labels, on=args.id_col, how="inner")
     # stratified sample toward --sample rows
     try:
@@ -112,7 +136,9 @@ def encode_matrix(df, num, cat):
         mask.append(False)
         names.append(c)
     for c in cat:
-        codes = pd.factorize(df[c].astype("object"))[0].astype(float)
+        # +1 so missing (factorize sentinel -1) -> 0; all codes non-negative,
+        # which lets the baseline model use them as NATIVE categorical features.
+        codes = (pd.factorize(df[c].astype("object"))[0] + 1).astype(float)
         parts.append(codes)
         mask.append(True)
         names.append(c)
@@ -170,14 +196,24 @@ def permutation_null(X, y, mask, k):
     return np.percentile(null, 95, axis=0)
 
 
-def baseline_model(X, y, names, group=None):
+def baseline_model(X, y, names, mask=None, group=None):
     from sklearn.ensemble import HistGradientBoostingClassifier
     from sklearn.model_selection import StratifiedKFold, GroupKFold, train_test_split, cross_val_predict
     from sklearn.metrics import f1_score, roc_auc_score, confusion_matrix
     from sklearn.inspection import permutation_importance
     from sklearn.preprocessing import label_binarize
 
-    clf = HistGradientBoostingClassifier(max_depth=4, max_iter=200, random_state=0)
+    # treat the discrete columns as NATIVE categorical features so the model can
+    # actually use ids / text-derived cities (not arbitrary codes). Cap at 255
+    # categories (HGB's limit); anything higher falls back to continuous.
+    cat_feats = None
+    if mask is not None and np.any(mask):
+        card = np.array([np.unique(X[:, i]).size for i in range(X.shape[1])])
+        cat_feats = mask & (card <= 255)
+        if not np.any(cat_feats):
+            cat_feats = None
+    clf = HistGradientBoostingClassifier(max_depth=4, max_iter=200, random_state=0,
+                                         categorical_features=cat_feats)
     if group is not None:
         cv = GroupKFold(n_splits=min(5, len(np.unique(group))))
         splits = cv.split(X, y, group)
@@ -293,6 +329,10 @@ def recommend(row):
         return "drop", "no signal over null" if not row["beats_null"] else "too sparse"
     if not np.isnan(row.get("best_auc", np.nan)) and row["best_auc"] > 0.97:
         return "investigate", "suspiciously strong — check leakage"
+    # normalized MI catches near-deterministic CATEGORICAL leaks (no AUC), e.g.
+    # an id/self-report column that nearly equals the label.
+    if row.get("mi_ratio", 0.0) > 0.80:
+        return "investigate", "explains most of the label — check leakage"
     if row.get("redundant_with"):
         return "investigate", f"redundant with {row['redundant_with']}"
     if not np.isnan(row.get("stability_cv", np.nan)) and row["stability_cv"] > 1.0:
@@ -331,7 +371,7 @@ def write_report(args, df, res, plots, num):
         L.append("![redundancy](%s/redundancy.png)\n" % figrel)
 
     L.append("\n## Per-feature\n")
-    cols = ["feature", "recommend", "reason", "mi", "null_p95", "beats_null",
+    cols = ["feature", "recommend", "reason", "mi", "mi_ratio", "null_p95", "beats_null",
             "best_auc", "importance", "coverage", "stability_cv"]
     L.append("| " + " | ".join(cols) + " |")
     L.append("|" + "|".join(["---"] * len(cols)) + "|")
@@ -361,6 +401,8 @@ def main():
     ap.add_argument("--remote"); ap.add_argument("--sample", type=int, default=200000)
     ap.add_argument("--perm", type=int, default=30)
     ap.add_argument("--features", nargs="*", default=None)
+    ap.add_argument("--format", default=None,
+                    help="spark read format for path inputs (parquet/csv/json); inferred if omitted")
     ap.add_argument("--out", default="validation/report.md")
     args = ap.parse_args()
     args.figdir = os.path.join(os.path.dirname(args.out) or ".", "figures")
@@ -379,11 +421,15 @@ def main():
     X, mask, names = encode_matrix(df, num, cat)
 
     mi = mi_all(X, y, mask)
+    _, _cnt = np.unique(y, return_counts=True)            # label entropy (nats)
+    _p = _cnt / _cnt.sum()
+    Hy = max(float(-(_p * np.log(_p)).sum()), 1e-9)
+    mi_ratio = {names[i]: float(mi[i] / Hy) for i in range(len(names))}
     null95 = permutation_null(X, y, mask, args.perm)
     aucs = {c: (best_ovr_auc(df[c].to_numpy(), y, classes) if c in num else np.nan) for c in names}
     cov = {c: float(df[c].notna().mean()) for c in names}
     stab = stability(df, num, cat, args.label_col, args.time_col) if args.time_col else {}
-    base = baseline_model(X, y, names,
+    base = baseline_model(X, y, names, mask=mask,
                           group=df[args.group_col].to_numpy() if args.group_col else None)
 
     # redundancy: flag each numeric feature's strongest partner > 0.9
@@ -402,6 +448,7 @@ def main():
     for i, c in enumerate(names):
         row = dict(feature=c, mi=float(mi[i]), null_p95=float(null95[i]),
                    beats_null=bool(mi[i] > null95[i]), best_auc=float(aucs[c]),
+                   mi_ratio=mi_ratio[c],
                    importance=float(base["importance"].get(c, 0.0)),
                    coverage=cov[c], stability_cv=float(stab.get(c, np.nan)),
                    redundant_with=redundant.get(c))

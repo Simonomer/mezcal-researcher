@@ -1,119 +1,121 @@
 #!/usr/bin/env python3
 """
-build_features_spark.py — REAL-WORLD materialization on Spark / Spark Connect.
+build_features_spark.py — REAL-WORLD materialization on Spark / Spark Connect for
+the 50-city / 30-labeled text problem. Cluster-side counterpart of the pandas
+build_features.py; everything is a distributed DataFrame op and the output is
+written back to the catalog (or a path). Nothing large is pulled to the driver.
 
-This is the cluster-side counterpart of the local `build_features.py`. Same
-features, same leakage rules, but everything is a distributed DataFrame op and
-the output is written back to the catalog — nothing large is pulled to the
-driver. Run it inside your Spark notebook (it picks up the active session) or
-as a client against Spark Connect (set SPARK_REMOTE=sc://host:15002).
+Reads from a catalog schema OR a base path on HDFS / S3 / GCS / DBFS — set SOURCE:
+    export SOURCE=telco                      # catalog: spark.table("telco.messages")
+    export SOURCE=s3://bucket/telco          # path:    spark.read.parquet("s3://…/messages")
+    export SPARK_REMOTE=sc://host:15002      # if running as a Connect client
 
-It is a TEMPLATE: point DB/table names at your catalog and extend with the rest
-of your backlog rows following the same patterns. (Adapted from the tested
-pandas builder; tailor to your schema before running.)
+It is a TEMPLATE showing the patterns (text extraction, out-of-fold train-only
+neighbor labels with PARTIAL coverage, geo modal, the deliberate leaks). Extend
+with the remaining backlog rows and tailor names/paths to your warehouse.
 
-    spark-submit build_features_spark.py        # or run cell-by-cell in a notebook
+    spark-submit build_features_spark.py     # or run cell-by-cell in a notebook
 """
 
 import os
-from functools import reduce
-from operator import add
-
 from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
 
-# --- session: use the notebook's active session, else Spark Connect ----------
 spark = (SparkSession.getActiveSession()
          or SparkSession.builder.remote(os.environ["SPARK_REMOTE"]).getOrCreate())
-
-DB = os.environ.get("FEATURE_DB", "telco")     # your catalog/schema
-K = 5                                          # CV folds for the OOF neighbor feature
-CITIES = ["city_A", "city_B", "city_C", "city_D", "city_E"]
-REGIONS = [f"reg_{c[-1]}" for c in CITIES]
-
-
-# --- helpers -----------------------------------------------------------------
-def cat_fractions(df, key, cat_col, categories, prefix):
-    """Per-entity normalized category counts -> *_frac_<cat> + *_entropy."""
-    counts = df.groupBy(key).pivot(cat_col, categories).count().na.fill(0)
-    total = reduce(add, [F.col(c) for c in categories])
-    out = counts
-    for c in categories:
-        out = out.withColumn(f"{prefix}_frac_{c}", (F.col(c) / total))
-    ent = reduce(add, [F.when(F.col(c) > 0, -(F.col(c) / total) * F.log(F.col(c) / total))
-                        .otherwise(F.lit(0.0)) for c in categories])
-    out = out.withColumn(f"{prefix}_entropy", ent)
-    return out.drop(*categories)
+SOURCE = os.environ.get("SOURCE", "telco")
+OUT = os.environ.get("FEATURE_OUT", f"{SOURCE}.home_city_features"
+                     if "://" not in SOURCE and not SOURCE.startswith("/")
+                     else f"{SOURCE.rstrip('/')}/home_city_features")
+K = 5
+CITY_NUM = r"city_(\d{2})"
 
 
-def top_category(df, key, cat_col, out_name):
-    """Modal category per entity (argmax of the counts)."""
-    w = Window.partitionBy(key).orderBy(F.desc("cnt"))
-    return (df.groupBy(key, cat_col).count().withColumnRenamed("count", "cnt")
-            .withColumn("rk", F.row_number().over(w)).filter("rk = 1")
-            .select(key, F.col(cat_col).alias(out_name)))
+def read(name):
+    """Catalog table (schema.name) OR parquet under a base path (HDFS/S3/GCS/DBFS)."""
+    if "://" in SOURCE or SOURCE.startswith(("/", "dbfs:")):
+        return spark.read.parquet(f"{SOURCE.rstrip('/')}/{name}")
+    return spark.table(f"{SOURCE}.{name}")
+
+
+def modal(df, key, cat_col, out_name):
+    """argmax category per entity + its share + entropy."""
+    g = df.groupBy(key, cat_col).count()
+    w = Window.partitionBy(key)
+    g = (g.withColumn("tot", F.sum("count").over(w))
+         .withColumn("p", F.col("count") / F.col("tot"))
+         .withColumn("rk", F.row_number().over(w.orderBy(F.desc("count")))))
+    top = g.filter("rk = 1").select(key, F.col(cat_col).alias(out_name),
+                                    F.col("p").alias(f"{out_name}_frac"))
+    entdf = (g.groupBy(key).agg((-F.sum(F.col("p") * F.log("p"))).alias(f"{out_name}_entropy")))
+    return top.join(entdf, key)
 
 
 # --- load --------------------------------------------------------------------
-comms = spark.table(f"{DB}.comms")
-labels = spark.table(f"{DB}.home_city").select("civ_id", "home_city")
-civ = spark.table(f"{DB}.civilians")
+messages = read("messages").dropDuplicates()
+people = read("people").dropDuplicates(["person_id"])
+labels = read("home_city").dropDuplicates(["person_id"]).select("person_id", "home_city")
 
-# === tower-region geography (near-leak strong; no labels needed) =============
-tp = (spark.table(f"{DB}.tower_pings")
-      .join(spark.table(f"{DB}.towers").select("tower_id", "region_code"), "tower_id"))
-tower = cat_fractions(tp, "civ_id", "region_code", REGIONS, "tower")
-tower = tower.join(top_category(tp, "civ_id", "region_code", "tower_top"), "civ_id", "left")
+feat = people.select("person_id")
 
-# === merchant-city geography (partial; null city for online merchants) =======
-tx = (spark.table(f"{DB}.transactions")
-      .join(spark.table(f"{DB}.merchants").select("merchant_id", "merchant_city", "is_online"),
-            "merchant_id"))
-merch_online = tx.groupBy("civ_id").agg(F.avg(F.col("is_online").cast("double")).alias("merch_online_frac"))
-in_store = tx.filter(F.col("merchant_city").isNotNull())
-merch = cat_fractions(in_store, "civ_id", "merchant_city", CITIES, "merch")
+# === TEXT content ============================================================
+# tokenize -> per-token regex; flavor tokens reveal the city, explicit mentions
+# are a near-leak. (regexp/rlike/explode are portable across Spark + Connect.)
+toks = messages.select(F.col("sender_id").alias("person_id"),
+                       F.explode(F.split(F.coalesce("text", F.lit("")), r"\s+")).alias("tok"))
+flav = (toks.filter(F.col("tok").rlike(r"^(land|team|slang)_city_\d{2}$"))
+        .withColumn("fcity", F.concat(F.lit("city_"), F.regexp_extract("tok", CITY_NUM, 1))))
+feat = feat.join(modal(flav, "person_id", "fcity", "txt_flavor_top_city"), "person_id", "left")
+ment = (toks.filter(F.col("tok").rlike(r"^cityname_city_\d{2}$"))
+        .withColumn("mcity", F.concat(F.lit("city_"), F.regexp_extract("tok", CITY_NUM, 1))))
+feat = feat.join(modal(ment, "person_id", "mcity", "txt_modal_mention_city"), "person_id", "left")
+feat = feat.join(messages.groupBy(F.col("sender_id").alias("person_id"))
+                 .agg(F.count(F.lit(1)).alias("txt_n_messages"),
+                      F.first("lang").alias("txt_lang_dominant")), "person_id", "left")
 
-# === activity-hour (faint timezone proxy) + degree (structural) ==============
-hr = spark.table(f"{DB}.app_events").withColumn("h", F.hour("ts"))
-act = hr.groupBy("civ_id").agg(F.avg("h").alias("act_hour_mean"), F.stddev("h").alias("act_hour_std"))
-deg = comms.groupBy(F.col("caller_id").alias("civ_id")).agg(F.count("*").alias("deg_out"))
+# === GRAPH: degree + OUT-OF-FOLD, TRAIN-ONLY neighbor city (partial labels) ===
+edges = (messages.select(F.col("sender_id").alias("a"), F.col("recipient_id").alias("b"))
+         .unionByName(messages.select(F.col("recipient_id").alias("a"), F.col("sender_id").alias("b"))))
+feat = feat.join(edges.groupBy(F.col("a").alias("person_id")).agg(F.countDistinct("b").alias("deg_total")),
+                 "person_id", "left")
+# deterministic fold per LABELED person; unlabeled -> -1. Only labeled neighbors
+# in a DIFFERENT fold contribute -> a person's own/fold label never leaks in.
+folds = labels.withColumn("fold", F.pmod(F.hash("person_id"), F.lit(K)))
+allf = people.select("person_id").join(folds.select("person_id", "fold"), "person_id", "left") \
+             .fillna({"fold": -1})
+nbr = (edges.join(folds.selectExpr("person_id as b", "home_city as b_city", "fold as b_fold"), "b")
+       .join(allf.selectExpr("person_id as a", "fold as a_fold"), "a")
+       .filter(F.col("a_fold") != F.col("b_fold")))          # train-fold-only
+feat = feat.join(modal(nbr, "a", "b_city", "nb_modal_city")
+                 .withColumnRenamed("a", "person_id"), "person_id", "left")
 
-# === NEIGHBOR-CITY MIX — out-of-fold, TRAIN-LABELS-ONLY (the leak-critical one)
-# Deterministic fold per civ; a civilian's neighbor counts use ONLY contacts in
-# *other* folds -> its own label (and its own fold's labels) can never enter.
-# Carry this same `fold` column into evaluation for strict OOF consistency.
-folds = labels.withColumn("fold", F.pmod(F.hash("civ_id"), F.lit(K)))
-edges = (comms.select(F.col("caller_id").alias("a"), F.col("callee_id").alias("b"))
-         .unionByName(comms.select(F.col("callee_id").alias("a"), F.col("caller_id").alias("b"))))
-labeled = (edges
-           .join(folds.selectExpr("civ_id as b", "home_city as b_city", "fold as b_fold"), "b")
-           .join(folds.selectExpr("civ_id as a", "fold as a_fold"), "a")
-           .filter(F.col("a_fold") != F.col("b_fold")))          # <-- train-fold only
-nb = (cat_fractions(labeled, "a", "b_city", CITIES, "nb")
-      .withColumnRenamed("a", "civ_id"))           # -> nb_frac_city_A.., nb_entropy
-nb = nb.join(top_category(labeled, "a", "b_city", "nb_modal_city")
-             .withColumnRenamed("a", "civ_id"), "civ_id", "left")
+# === GEO: tower region + merchant city (normalize messy casing/space) ========
+tp = read("tower_pings").join(read("towers").select("tower_id", "region_code"), "tower_id")
+feat = feat.join(modal(tp, "person_id", "region_code", "tower_modal_region"), "person_id", "left")
+merch = read("merchants").withColumn(
+    "mc", F.concat(F.lit("city_"), F.regexp_extract(F.lower(F.trim("merchant_city")), CITY_NUM, 1)))
+tx = read("transactions").join(merch.select("merchant_id", "mc", "is_online"), "merchant_id")
+feat = feat.join(modal(tx.filter(F.col("mc") != "city_"), "person_id", "mc", "merch_modal_city"),
+                 "person_id", "left")
 
-# === DELIBERATE LEAK (built so the screen catches it) ========================
-# weather_logs is per-region; the ONLY way to attach it to a civ is through their
-# home region -- i.e. the label. Region annual mean temp keyed on the answer.
-reg_temp = spark.table(f"{DB}.weather_logs").groupBy("region_code").agg(F.avg("temp_c").alias("t"))
-civ_region = labels.withColumn("region_code", F.concat(F.lit("reg_"), F.substring("home_city", -1, 1)))
-wx = (civ_region.join(reg_temp, "region_code")
-      .select("civ_id", F.col("t").alias("wx_home_region_temp")))
+# === DELIBERATE LEAKS (built so the screen flags them) =======================
+feat = feat.join(read("ip_geo").select("person_id", F.col("ip_city")), "person_id", "left")  # ≈ answer
+feat = feat.join(people.select("person_id", F.concat(
+    F.lit("city_"), F.regexp_extract(F.lower(F.trim("raw_city_text")), CITY_NUM, 1)).alias("declared_city")),
+    "person_id", "left")
+# weather joined via the person's HOME region (= the label) -> metro-level leak
+reg_temp = read("weather_logs").groupBy("region_code").agg(F.avg("temp_c").alias("wx_home_region_temp"))
+home_region = labels.withColumn(
+    "region_code", F.concat(F.lit("metro_"), (F.regexp_extract("home_city", CITY_NUM, 1).cast("int") / 5).cast("int")))
+feat = feat.join(home_region.join(reg_temp, "region_code").select("person_id", "wx_home_region_temp"),
+                 "person_id", "left")
 
-# === passthrough demographics + stability time axis ==========================
-base = civ.select("civ_id", "age", "language_pref", "device_type",
-                  F.col("account_created_at").alias("ref_ts"))
-
-# === assemble (left joins on civ_id) + write back to the catalog =============
-feat = base
-for part in [tower, merch, merch_online, act, deg, nb, wx]:
-    feat = feat.join(part, "civ_id", "left")
-
-(feat.write.mode("overwrite").saveAsTable(f"{DB}.home_city_features"))
-print(f"wrote {DB}.home_city_features  ({len(feat.columns)} columns)")
-print("next: python scripts/signal_panel.py "
-      f"--features-table {DB}.home_city_features --labels-table {DB}.home_city "
-      "--id-col civ_id --label-col home_city --time-col ref_ts --perm 40 "
-      "--out validation/report.md   # (SPARK_REMOTE picked up automatically)")
+# === demographics + write ====================================================
+feat = feat.join(people.selectExpr("person_id", "age", "declared_language", "device",
+                                    "signup_at as ref_ts"), "person_id", "left")
+(feat.write.mode("overwrite").saveAsTable(OUT) if "://" not in str(OUT) and not str(OUT).startswith("/")
+ else feat.write.mode("overwrite").parquet(OUT))
+print(f"wrote {OUT}  ({len(feat.columns)} columns)")
+print(f"screen it:  python scripts/signal_panel.py --features-table {OUT} "
+      f"--labels-table {SOURCE}{'.' if '://' not in SOURCE else '/'}home_city "
+      "--id-col person_id --label-col home_city --perm 40 --out validation/report.md")

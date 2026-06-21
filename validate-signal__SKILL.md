@@ -24,8 +24,10 @@ final word is full-model out-of-sample performance.
 
 ## Steps
 
-1. **Get inputs.** Feature table + label table (Spark `--features-table` /
-   `--labels-table`, or local `--features-file` / `--labels-file`), plus
+1. **Get inputs.** Feature table + label table. Spark `--features-table` /
+   `--labels-table` accept a catalog table (`matcha.feat`) OR a path on HDFS /
+   S3 / S3A / GCS / DBFS (`s3://bucket/feat`, `hdfs://…`, `/lake/feat/*.parquet`;
+   `--format` to override). Or local `--features-file` / `--labels-file`. Plus
    `--id-col`, `--label-col`, and if available `--time-col` (stability) and
    `--group-col` (grouped CV, e.g. entity/connected groups).
 
@@ -33,18 +35,22 @@ final word is full-model out-of-sample performance.
    yourself):
    ```bash
    python "${CLAUDE_SKILL_DIR}/scripts/signal_panel.py" \
-       --features-table T_FEAT --labels-table T_LAB \
+       --features-table T_FEAT --labels-table T_LAB \   # tables OR s3://… / hdfs://… paths
        --id-col ID --label-col LABEL [--time-col TS] [--group-col GID] \
-       [--remote sc://HOST:PORT] --out validation/report.md
+       [--remote sc://HOST:PORT] [--format parquet] --out validation/report.md
    ```
    Over Spark Connect it samples + joins as DataFrame ops, pulls a stratified
-   sample to the driver for the sklearn/scipy metrics.
+   sample to the driver for the sklearn/scipy metrics. Discrete columns are used
+   as NATIVE categorical features in the baseline model (ids / text-derived
+   categories, not arbitrary codes).
 
 3. **Summarize for the user.** Read `validation/report.md`. Report keep /
    investigate / drop counts, the baseline macro-F1/AUC, and call out: features
    that didn't beat the null (noise), redundant pairs, unstable-over-time
-   features, and any "suspiciously strong" single feature — high univariate AUC
-   often means leakage, so flag it to investigate, not celebrate.
+   features, and any "suspiciously strong" feature — flag to investigate, not
+   celebrate. Two leak detectors: high one-vs-rest **AUC** (numeric) and high
+   **mi_ratio** = MI ÷ label-entropy (catches near-deterministic *categorical*
+   leaks like an id/self-report column that nearly equals the label).
 
 Screening only. Feed the kept features into the model; loop the dropped/weak ones
 back to ideate-features for a fresh batch.

@@ -32,6 +32,27 @@ def get_spark(remote=None):
         return None, str(e)
 
 
+def spark_read(spark, ref, fmt=None):
+    """Read a catalog table OR a path on HDFS / S3 / S3A / GCS / DBFS / local.
+
+    A ref with a scheme (s3://, s3a://, hdfs://, gs://, dbfs:), a leading slash,
+    a glob, or a data extension is read with spark.read.<format> (inferred from
+    the extension unless `fmt` is given); otherwise it is a catalog table.
+    """
+    is_path = ("://" in ref or ref.startswith(("/", "dbfs:", "file:"))
+               or ref.endswith((".parquet", ".csv", ".tsv", ".json")) or "*" in ref)
+    if not is_path:
+        return spark.table(ref)
+    if fmt is None:
+        fmt = ("csv" if ref.endswith((".csv", ".tsv")) else
+               "json" if ref.endswith(".json") else "parquet")
+    reader = spark.read
+    if fmt == "csv":
+        sep = "\t" if ref.endswith(".tsv") else ","
+        reader = reader.option("header", True).option("inferSchema", True).option("sep", sep)
+    return reader.format(fmt).load(ref)
+
+
 def looks_like_time(name, dtype, sample_vals):
     if dtype in ("timestamp", "date") or "timestamp" in dtype or "date" in dtype:
         return True
@@ -58,10 +79,10 @@ def fmt_sample(vals, k=3):
     return ", ".join(out) if out else "—"
 
 
-def profile_one(spark, name, sample_rows, do_count, do_keys):
+def profile_one(spark, name, sample_rows, do_count, do_keys, fmt=None):
     from pyspark.sql import functions as F
     try:
-        df = spark.table(name)
+        df = spark_read(spark, name, fmt)
     except Exception as e:  # noqa: BLE001
         print(f"\n## {name}\n\n> could not read table: {e}\n")
         return name, set()
@@ -134,10 +155,12 @@ for name in [{joined}]:
 
 def main():
     ap = argparse.ArgumentParser(description="Spark-native profiler for feature ideation.")
-    ap.add_argument("tables", nargs="+", help="catalog table names, e.g. matcha.table123")
+    ap.add_argument("tables", nargs="+",
+                    help="catalog tables (matcha.t1) OR paths (s3://…, hdfs://…, /path/*.parquet)")
     ap.add_argument("--sample", type=int, default=100000, help="sample rows per table (default 100000)")
     ap.add_argument("--count", action="store_true", help="also compute exact full row count (full scan)")
     ap.add_argument("--keys", action="store_true", help="approx-distinct on key-like columns over full table")
+    ap.add_argument("--format", default=None, help="read format for path inputs (parquet/csv/json); inferred if omitted")
     ap.add_argument("--remote", default=None,
                     help="Spark Connect URL, e.g. sc://host:15002 (else uses SPARK_REMOTE)")
     args = ap.parse_args()
@@ -154,7 +177,7 @@ def main():
     print(f"# Table inventory ({len(args.tables)} tables) — Spark-native, sampled")
     keys_by_table = {}
     for name in args.tables:
-        tname, keys = profile_one(spark, name, args.sample, args.count, args.keys)
+        tname, keys = profile_one(spark, name, args.sample, args.count, args.keys, args.format)
         keys_by_table[tname] = keys
 
     shared = {}

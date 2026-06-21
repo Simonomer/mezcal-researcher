@@ -1,8 +1,8 @@
 # Signal validation — home_city
 
-- sample rows: 7,000  ·  classes: 5  ·  features: 44
-- baseline (HGB): macro-F1 = 1.000, macro-AUC = 1.000
-- recommendation: keep 16 · investigate 15 · drop 13
+- sample rows: 5,240  ·  classes: 30  ·  features: 41
+- baseline (HGB): macro-F1 = 0.091, macro-AUC = 0.526
+- recommendation: keep 10 · investigate 7 · drop 24
 
 ![ranking](figures/signal_ranking.png)
 
@@ -10,58 +10,53 @@
 
 ![confusion](figures/confusion.png)
 
-![by_class](figures/by_class.png)
-
 ![redundancy](figures/redundancy.png)
 
 
 ## Per-feature
 
-| feature | recommend | reason | mi | null_p95 | beats_null | best_auc | importance | coverage | stability_cv |
-|---|---|---|---|---|---|---|---|---|---|
-| tower_entropy | drop | no signal over null | 0.010 | 0.010 | False | 0.552 | 0.000 | 1.000 | 0.652 |
-| merch_txn_count | drop | no signal over null | 0.005 | 0.013 | False | 0.519 | 0.000 | 1.000 | 1.685 |
-| deg_out | drop | no signal over null | 0.005 | 0.014 | False | 0.509 | 0.000 | 1.000 | 0.313 |
-| device_screen_size | drop | no signal over null | 0.005 | 0.013 | False | 0.515 | 0.000 | 1.000 | 0.873 |
-| merch_online_frac | drop | no signal over null | 0.003 | 0.015 | False | 0.519 | 0.000 | 1.000 | 2.000 |
-| app_n_event_types | drop | no signal over null | 0.001 | 0.002 | False | — | 0.000 | 1.000 | 0.308 |
-| act_hour_std | drop | no signal over null | 0.001 | 0.011 | False | 0.561 | 0.000 | 1.000 | 0.103 |
-| os_version | drop | no signal over null | 0.001 | 0.002 | False | — | 0.000 | 1.000 | 0.401 |
-| device_type | drop | no signal over null | 0.000 | 0.001 | False | — | 0.000 | 1.000 | 0.321 |
-| app_event_count | drop | no signal over null | 0.000 | 0.012 | False | 0.516 | 0.000 | 1.000 | 1.399 |
-| call_frac | drop | no signal over null | 0.000 | 0.013 | False | 0.507 | 0.000 | 1.000 | 1.253 |
-| age | drop | no signal over null | 0.000 | 0.010 | False | 0.514 | 0.000 | 1.000 | 0.982 |
-| device_battery_health | drop | no signal over null | 0.000 | 0.012 | False | 0.513 | 0.000 | 1.000 | 2.000 |
-| wx_home_region_temp | investigate | suspiciously strong — check leakage | 1.493 | 0.008 | True | 1.000 | 0.279 | 1.000 | 0.006 |
-| wx_home_region_precip | investigate | suspiciously strong — check leakage | 1.475 | 0.008 | True | 1.000 | 0.318 | 1.000 | 0.007 |
-| nb_frac_city_A | investigate | suspiciously strong — check leakage | 0.687 | 0.014 | True | 0.977 | 0.000 | 1.000 | 0.030 |
-| nb_frac_city_C | investigate | suspiciously strong — check leakage | 0.637 | 0.013 | True | 0.991 | 0.000 | 1.000 | 0.021 |
-| nb_frac_city_B | investigate | suspiciously strong — check leakage | 0.610 | 0.012 | True | 0.975 | 0.000 | 1.000 | 0.042 |
-| nb_frac_city_D | investigate | suspiciously strong — check leakage | 0.516 | 0.018 | True | 0.987 | 0.000 | 1.000 | 0.055 |
-| tower_frac_reg_D | investigate | suspiciously strong — check leakage | 0.445 | 0.015 | True | 0.984 | 0.000 | 1.000 | 0.027 |
-| tower_frac_reg_C | investigate | suspiciously strong — check leakage | 0.434 | 0.012 | True | 0.981 | 0.000 | 1.000 | 0.062 |
-| nb_frac_city_E | investigate | suspiciously strong — check leakage | 0.272 | 0.011 | True | 1.000 | 0.000 | 1.000 | 0.100 |
-| merch_frac_city_E | investigate | suspiciously strong — check leakage | 0.267 | 0.010 | True | 0.996 | 0.000 | 1.000 | 0.046 |
-| tower_frac_reg_E | investigate | suspiciously strong — check leakage | 0.248 | 0.011 | True | 0.998 | 0.000 | 1.000 | 0.126 |
-| deg_total | investigate | redundant with contact_entropy | 0.040 | 0.013 | True | 0.645 | 0.000 | 1.000 | 0.531 |
-| contact_entropy | investigate | redundant with deg_total | 0.039 | 0.015 | True | 0.644 | 0.000 | 1.000 | 0.222 |
-| act_hour_mean | investigate | unstable over time | 0.020 | 0.013 | True | 0.600 | 0.000 | 1.000 | 1.121 |
-| nb_label_coverage | investigate | weak incremental value | 0.011 | 0.008 | True | 0.514 | 0.000 | 1.000 | 0.498 |
-| nb_modal_city | keep | beats null, contributes in model | 1.132 | 0.002 | True | — | 0.000 | 1.000 | 0.017 |
-| tower_top | keep | beats null, contributes in model | 1.060 | 0.002 | True | — | 0.000 | 1.000 | 0.021 |
-| merch_top | keep | beats null, contributes in model | 0.896 | 0.002 | True | — | 0.000 | 1.000 | 0.014 |
-| tower_frac_reg_A | keep | beats null, contributes in model | 0.585 | 0.015 | True | 0.968 | 0.000 | 1.000 | 0.009 |
-| merch_frac_city_A | keep | beats null, contributes in model | 0.464 | 0.013 | True | 0.925 | 0.000 | 1.000 | 0.029 |
-| merch_frac_city_B | keep | beats null, contributes in model | 0.462 | 0.015 | True | 0.920 | 0.000 | 1.000 | 0.044 |
-| tower_frac_reg_B | keep | beats null, contributes in model | 0.461 | 0.011 | True | 0.960 | 0.000 | 1.000 | 0.023 |
-| merch_frac_city_C | keep | beats null, contributes in model | 0.456 | 0.012 | True | 0.959 | 0.000 | 1.000 | 0.051 |
-| merch_frac_city_D | keep | beats null, contributes in model | 0.416 | 0.010 | True | 0.949 | 0.000 | 1.000 | 0.024 |
-| nb_city_entropy | keep | beats null, contributes in model | 0.092 | 0.011 | True | 0.648 | 0.000 | 1.000 | 0.201 |
-| deg_in | keep | beats null, contributes in model | 0.065 | 0.008 | True | 0.701 | 0.000 | 0.999 | 0.214 |
-| merch_entropy | keep | beats null, contributes in model | 0.031 | 0.009 | True | 0.617 | 0.000 | 1.000 | 0.713 |
-| act_peak_hour | keep | beats null, contributes in model | 0.021 | 0.012 | True | 0.593 | 0.000 | 1.000 | 0.316 |
-| language_pref | keep | beats null, contributes in model | 0.018 | 0.001 | True | — | 0.000 | 1.000 | 0.225 |
-| merch_n_cat | keep | beats null, contributes in model | 0.014 | 0.002 | True | — | 0.000 | 1.000 | 0.237 |
-| tower_n_cat | keep | beats null, contributes in model | 0.006 | 0.002 | True | — | 0.000 | 1.000 | 0.373 |
+| feature | recommend | reason | mi | mi_ratio | null_p95 | beats_null | best_auc | importance | coverage | stability_cv |
+|---|---|---|---|---|---|---|---|---|---|---|
+| txt_total_tokens | drop | no signal over null | 0.020 | 0.007 | 0.020 | False | 0.597 | 0.003 | 0.999 | 1.014 |
+| merch_top_frac | drop | no signal over null | 0.014 | 0.005 | 0.018 | False | 0.563 | 0.002 | 1.000 | 0.736 |
+| act_hour_std | drop | no signal over null | 0.011 | 0.004 | 0.022 | False | 0.616 | 0.001 | 1.000 | 1.903 |
+| tower_top_frac | drop | no signal over null | 0.011 | 0.004 | 0.018 | False | 0.606 | 0.003 | 1.000 | 1.083 |
+| txt_vocab_richness | drop | no signal over null | 0.010 | 0.003 | 0.015 | False | 0.604 | -0.004 | 0.999 | 2.000 |
+| device | drop | no signal over null | 0.009 | 0.003 | 0.010 | False | — | -0.003 | 0.952 | 0.134 |
+| txt_n_city_mentions | drop | no signal over null | 0.009 | 0.003 | 0.013 | False | — | -0.001 | 0.387 | 0.079 |
+| doc_len | drop | no signal over null | 0.004 | 0.001 | 0.012 | False | 0.841 | 0.001 | 0.244 | 0.687 |
+| txt_flavor_entropy | drop | no signal over null | 0.003 | 0.001 | 0.016 | False | 0.590 | -0.001 | 0.839 | 1.155 |
+| doc_n_city_mentions | drop | no signal over null | 0.003 | 0.001 | 0.004 | False | — | 0.000 | 0.048 | 0.193 |
+| act_hour_mean | drop | no signal over null | 0.003 | 0.001 | 0.007 | False | 0.584 | 0.002 | 1.000 | 1.227 |
+| age | drop | no signal over null | 0.003 | 0.001 | 0.015 | False | 0.625 | 0.001 | 0.949 | 1.941 |
+| doc_present | drop | no signal over null | 0.003 | 0.001 | 0.004 | False | — | 0.000 | 1.000 | 0.229 |
+| txt_url_frac | drop | no signal over null | 0.002 | 0.001 | 0.016 | False | 0.647 | 0.010 | 0.999 | 1.359 |
+| tower_entropy | drop | no signal over null | 0.001 | 0.000 | 0.013 | False | 0.610 | 0.003 | 1.000 | 0.947 |
+| battery | drop | no signal over null | 0.000 | 0.000 | 0.019 | False | 0.609 | -0.001 | 1.000 | 0.000 |
+| txt_flavor_top_frac | drop | no signal over null | 0.000 | 0.000 | 0.018 | False | 0.585 | -0.000 | 0.839 | 0.785 |
+| txt_emoji_frac | drop | no signal over null | 0.000 | 0.000 | 0.013 | False | 0.597 | -0.000 | 0.999 | 1.832 |
+| txt_n_messages | drop | no signal over null | 0.000 | 0.000 | 0.022 | False | 0.600 | 0.001 | 1.000 | 0.000 |
+| deg_out | drop | no signal over null | 0.000 | 0.000 | 0.015 | False | 0.600 | 0.000 | 1.000 | 1.389 |
+| merch_online_frac | drop | no signal over null | 0.000 | 0.000 | 0.019 | False | 0.620 | -0.002 | 1.000 | 0.875 |
+| app_event_count | drop | no signal over null | 0.000 | 0.000 | 0.019 | False | 0.647 | 0.001 | 1.000 | 1.012 |
+| tenure_days | drop | no signal over null | 0.000 | 0.000 | 0.017 | False | 0.656 | -0.003 | 0.971 | 0.834 |
+| screen_in | drop | no signal over null | 0.000 | 0.000 | 0.013 | False | 0.690 | -0.000 | 1.000 | 1.439 |
+| nb_modal_city | investigate | explains most of the label — check leakage | 2.613 | 0.862 | 0.085 | True | — | 0.080 | 0.999 | 0.007 |
+| merch_modal_city | investigate | explains most of the label — check leakage | 2.486 | 0.820 | 0.132 | True | — | 0.096 | 1.000 | 0.011 |
+| wx_home_region_temp | investigate | suspiciously strong — check leakage | 1.993 | 0.657 | 0.017 | True | 0.997 | 0.031 | 1.000 | 0.004 |
+| nb_entropy | investigate | redundant with nb_top_frac | 0.198 | 0.065 | 0.023 | True | 0.855 | 0.003 | 0.999 | 0.155 |
+| nb_top_frac | investigate | redundant with nb_entropy | 0.157 | 0.052 | 0.015 | True | 0.918 | 0.000 | 0.999 | 0.138 |
+| deg_total | investigate | unstable over time | 0.038 | 0.013 | 0.018 | True | 0.790 | 0.003 | 1.000 | 1.156 |
+| reciprocity | investigate | unstable over time | 0.023 | 0.008 | 0.013 | True | 0.782 | 0.000 | 1.000 | 1.177 |
+| ip_city | keep | beats null, contributes in model | 2.211 | 0.730 | 0.131 | True | — | 0.130 | 0.923 | 0.012 |
+| tower_modal_region | keep | beats null, contributes in model | 1.996 | 0.659 | 0.029 | True | — | 0.118 | 1.000 | 0.004 |
+| txt_flavor_top_city | keep | beats null, contributes in model | 1.724 | 0.569 | 0.139 | True | — | 0.011 | 0.839 | 0.022 |
+| declared_city | keep | beats null, contributes in model | 1.555 | 0.513 | 0.125 | True | — | 0.022 | 0.647 | 0.019 |
+| txt_modal_mention_city | keep | beats null, contributes in model | 0.892 | 0.294 | 0.119 | True | — | 0.001 | 0.387 | 0.030 |
+| txt_lang_dominant | keep | beats null, contributes in model | 0.467 | 0.154 | 0.018 | True | — | -0.002 | 1.000 | 0.033 |
+| doc_flavor_top_city | keep | beats null, contributes in model | 0.439 | 0.145 | 0.114 | True | — | 0.000 | 0.218 | 0.040 |
+| declared_language | keep | beats null, contributes in model | 0.222 | 0.073 | 0.017 | True | — | -0.001 | 1.000 | 0.063 |
+| nb_labeled_frac | keep | beats null, contributes in model | 0.109 | 0.036 | 0.016 | True | 0.934 | 0.001 | 0.999 | 0.119 |
+| deg_in | keep | beats null, contributes in model | 0.050 | 0.016 | 0.012 | True | 0.872 | -0.003 | 0.999 | 0.484 |
 
 _Signal = beats shuffled-label null, has effect size, contributes incrementally in the model, and is stable. Screening only — the final word is full-model out-of-sample performance._

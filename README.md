@@ -12,144 +12,112 @@ data wiring** and **set the keep threshold**.
 
 ## The problem
 
-Predict each civilian's `home_city` (5 imbalanced classes) from a communication
-graph plus nine auxiliary tables. It is deliberately **hard**: noisy homophily
-(~63% of contacts share your city), ~12% travelers, confusable sister-cities
-(A↔B, C↔D), overlapping language/behavior, and two kinds of leakage traps — a
-per-region `weather_logs` table that can only be joined to a civilian *through
-their home region* (the answer), and near-decisive location features (tower
-region, merchant city) that look like leaks but are legitimate.
+Predict a person's `home_city` across **50 cities — but with ground truth for only
+30** of them (a normal-shaped, heavily imbalanced label; the other 20 cities'
+residents appear only as *unlabeled* graph/text context). The signal lives mostly
+in the **text people exchange**; supporting tables add graph, geography, sparse
+**documents**, and noise. It is deliberately hard and **messy**: ~60% homophily,
+~12% travelers, 50 cities in 10 confusable metros, ~5% label noise, nulls,
+duplicate rows/edges, inconsistent city casing/typos, mixed types — plus three
+leak traps (`ip_geo` ≈ the answer, self-reported `raw_city_text`, region-joined
+`weather`).
 
 ## How to run it
 
-The loop is the same everywhere — **profile → ideate → materialize → validate →
-(loop back)** — and each step's output is the next step's input. Pick your setup:
+Same loop everywhere — **profile → ideate → materialize → validate → (loop back)**.
 
-### A. Real world: your Spark tables (Spark Connect)
+### A. Real world: your Spark tables (catalog, HDFS, or S3)
 
-Your tables already exist, so you start at *ideate*. Point the skills at catalog
-table names and a Spark Connect URL; heavy work stays on the cluster and only a
-**bounded sample** is pulled to the driver.
+The skills read a catalog table **or** a path on HDFS / S3 / S3A / GCS / DBFS;
+heavy work stays on the cluster, only a bounded sample reaches the driver.
 
 ```bash
 pip install "pyspark[connect]" pandas scikit-learn scipy matplotlib pyarrow
 export SPARK_REMOTE=sc://YOUR-HOST:15002          # your Spark Connect endpoint
-```
 
-**1 · Ideate** — in the Claude Code chat box, name your catalog tables:
+# 1. Ideate — profile catalog tables OR paths, confirm wiring, get the backlog
+python scripts/profile_spark_tables.py warehouse.messages warehouse.people \
+    warehouse.home_city warehouse.tower_pings ... --keys          # or s3://bucket/messages …
 
-```
-/ideate-features predict home_city for civ_id;
-  tables telco.comms telco.civilians telco.home_city telco.tower_pings
-         telco.towers telco.transactions telco.merchants telco.app_events
-         telco.device_info telco.weather_logs
-```
+# 2. Materialize on the cluster (text extraction, OOF neighbor) -> a feature table
+SOURCE=warehouse python features/build_features_spark.py          # SOURCE may be s3://bucket/db
 
-→ runs `profile_spark_tables.py … --keys` (≈100k-row sample per table, profiled
-**cluster-side**), proposes the wiring, you confirm in plain text → writes
-[`features/backlog_homecity.md`](features/backlog_homecity.md).
-
-**2 · Materialize** — build the feature table in Spark and write it to the
-catalog. Adapt [`features/build_features_spark.py`](features/build_features_spark.py)
-(the Spark counterpart of the pandas builder — same leakage-safe out-of-fold
-neighbor encoding) and run it in your notebook or via the Connect client:
-
-```python
-feat.write.mode("overwrite").saveAsTable("telco.home_city_features")
-```
-
-**3 · Validate** — joins happen cluster-side; only a stratified sample comes to
-the driver for the sklearn/scipy metrics:
-
-```bash
+# 3. Validate — joins cluster-side, stratified sample to the driver
 python scripts/signal_panel.py \
-  --features-table telco.home_city_features --labels-table telco.home_city \
-  --id-col civ_id --label-col home_city --time-col ref_ts --perm 40 \
-  --out validation/report.md            # SPARK_REMOTE is picked up automatically
+    --features-table warehouse.home_city_features --labels-table warehouse.home_city \
+    --id-col person_id --label-col home_city --perm 25 --out validation/report.md
+#   --features-table also accepts s3://… / hdfs://… paths (--format to override)
 ```
 
-> **In-notebook (non-Connect) `spark`?** A script Claude launches runs in a
-> separate process and can't attach to your kernel's session. Either expose a
-> Spark Connect endpoint (then the above just works), or run the profiler's
-> emitted cell in your notebook and `saveAsTable` your feature/label tables so the
-> harness can read them. (Connection logic: `getActiveSession()` → `--remote` /
-> `$SPARK_REMOTE` → otherwise it prints a notebook cell.)
+> **In-notebook (non-Connect) `spark`?** A script Claude launches is a separate
+> process and can't attach to your kernel's session — expose a Spark Connect
+> endpoint, or run the profiler's emitted cell in your notebook and `saveAsTable`
+> the feature/label tables so the harness can read them.
 
 ### B. The reproducible demo in this repo (local, no cluster)
 
-No Spark needed — generate a synthetic dataset and run the whole loop on local
-parquet (this is what produced the results below):
-
 ```bash
-pip install pandas numpy scikit-learn scipy matplotlib networkx pyarrow
-python data/generate_data.py                          # 1. -> data/tables/*.parquet
-python scripts/inspect_tables.py data/tables          # 2a. profile (grounds ideation)
-#    -> features/backlog_homecity.md                  # 2b. the LLM backlog
-python features/build_features.py                     # 3. -> features/feature_table.parquet
-python scripts/signal_panel.py \                      # 4. screen
+pip install pandas numpy scikit-learn scipy matplotlib pyarrow
+python data/generate_data.py                          # 13 messy tables -> data/tables/
+python scripts/inspect_tables.py data/tables          # profile (grounds ideation)
+python features/build_features.py                     # -> features/feature_table.parquet (41 feats)
+python -X utf8 scripts/signal_panel.py \              # screen (─X utf8: Windows console)
   --features-file features/feature_table.parquet \
   --labels-file data/tables/home_city.parquet \
-  --id-col civ_id --label-col home_city --time-col ref_ts --perm 40 \
+  --id-col person_id --label-col home_city --time-col ref_ts --perm 25 \
   --out validation/report.md
 ```
 
-**Local vs Spark:** `inspect_tables.py` (local) reads files on disk — CSV by its
-first `--nrows` rows, parquet in full. `profile_spark_tables.py` and the validator
-take catalog tables + `--remote`/`$SPARK_REMOTE` and never do a full pull. On
-Windows, run the validator as `python -X utf8 …` (it emits an em-dash that crashes
-cp1252).
-
 ## Results
 
-The screen runs twice — once on the full table (with the planted leak) and once
-after the closed loop drops it — to separate "looks perfect" from "is real."
+The screen runs twice — on the full table, and after the closed loop drops the
+three flagged leaks:
 
 | run | features | baseline macro-F1 | macro-AUC | keep / investigate / drop |
 |---|---|---|---|---|
-| **Full table** (leak present) | 44 | **1.000** | 1.000 | 16 / 15 / 13 |
-| **Screened** (leak removed) | 42 | **0.934** | 0.994 | 16 / 13 / 13 |
+| **Full table** (leaks present) | 41 | **0.091** | 0.526 | 10 / 7 / 24 |
+| **Screened** (leaks removed)   | 38 | **0.845** | 0.830 | 9 / 6 / 23 |
 
-The leaked `macro-F1 = 1.000` looks perfect — and is a lie. The honest baseline is
-**0.934**, with the residual error landing exactly on the built-in confusable
-city-pairs (A↔B, C↔D) while the isolated class E stays clean.
+The headline is the **0.091 → 0.845** jump. Leakage is usually framed as *inflating*
+a score; here the high-cardinality leak columns (`ip_city`, `declared_city`)
+*wrecked* a naive 30-class baseline — so "train on everything and read the
+importances" gives a misleadingly hopeless 0.091. The aggregate model score lies
+in both directions; the **per-feature screen** tells the truth and says what to cut.
 
 **What the harness did, with the human only confirming wiring and ruling on flags:**
 
-- **Caught the planted leak.** The two `weather_logs`-derived features scored a
-  one-vs-rest **AUC of 1.000** and were the *only* features with non-zero model
-  importance (every legitimate feature read 0.000 — the tell that one feature
-  explains everything) → flagged *investigate*.
-- **Rejected all 13 red-herrings.** Every `device_info` column, app-telemetry
-  volume, `age`, and raw degree/spend counts failed to beat the permutation null
-  → *drop*.
-- **Flagged 9 near-decisive features** (the train-only neighbor and tower fractions,
-  AUC 0.97–1.0) and a **redundant pair** (`deg_total` ↔ `contact_entropy`) for a
-  human to bless or cut — shrinking the adjudication set from 44 to 15.
+- **Found the signal feature-by-feature** even though the all-features model failed:
+  MI ranks `nb_modal_city` (2.61), `merch_modal_city` (2.49), `ip_city` (2.21),
+  `tower_modal_region` (2.00), `txt_flavor_top_city` (1.72) at the top.
+- **Flagged the leaks.** A **normalized-MI** test (MI ÷ label entropy) — added to
+  catch *categorical* leaks an AUC test can't see — flagged `nb_modal_city` (0.86)
+  and `merch_modal_city` (0.82); `weather` tripped the numeric **AUC** flag (0.997);
+  `ip_city`/`declared_city` topped the MI ranking for the human to cut.
+- **Rejected all 24 red-herrings** (device, app telemetry, age, message-style
+  stats, document length, raw degree) against the permutation null.
 
-See [`validation/report.md`](validation/report.md) (full table) and
-[`validation/screened/report.md`](validation/screened/report.md) (closed-loop
-re-screen, leak removed).
+See [`validation/report.md`](validation/report.md) and
+[`validation/screened/report.md`](validation/screened/report.md).
 
 ## Repo layout
 
 | path | what |
 |---|---|
-| [`data/generate_data.py`](data/generate_data.py) | synthetic 10-table generator (hard, with leakage traps) |
-| [`data/tables/`](data/tables) | parquet output |
+| [`data/generate_data.py`](data/generate_data.py) | 13-table generator: text, docs, graph, geo, messy, 3 leak traps |
 | [`features/backlog_homecity.md`](features/backlog_homecity.md) | the LLM's ranked feature-hypothesis backlog |
-| [`features/build_features.py`](features/build_features.py) | materialization (local/pandas); OOF train-only neighbor encoding |
-| [`features/build_features_spark.py`](features/build_features_spark.py) | **real-world** Spark/Connect materialization template (writes a catalog table) |
+| [`features/build_features.py`](features/build_features.py) | materialization (local/pandas): text + OOF train-only neighbor (partial labels) |
+| [`features/build_features_spark.py`](features/build_features_spark.py) | **real-world** Spark/Connect materialization (reads catalog/HDFS/S3) |
 | [`scripts/inspect_tables.py`](scripts/inspect_tables.py) | local schema profiler (parquet/CSV) |
-| [`scripts/profile_spark_tables.py`](scripts/profile_spark_tables.py) | Spark/Connect schema profiler (catalog tables, bounded sample) |
-| [`scripts/signal_panel.py`](scripts/signal_panel.py) | the deterministic screening harness (local files **or** Spark tables) |
+| [`scripts/profile_spark_tables.py`](scripts/profile_spark_tables.py) | Spark/Connect profiler — catalog tables **or** HDFS/S3 paths |
+| [`scripts/signal_panel.py`](scripts/signal_panel.py) | screening harness (local files or Spark tables/paths; native categorical; AUC + normalized-MI leak flags) |
 | [`validation/report.md`](validation/report.md) | per-feature signal report + figures |
-| [`article/`](article) | the method article (markdown + PDF) |
+| [`article/`](article) | the method article (markdown + landscape PDF) |
 
-## Note on the validation command
+## Notes on the validation command
 
-The harness's `--group-col` feeds the column to `GroupKFold`. Passing the **label**
-(`home_city`) as the group would hold out an entire class per fold and collapse
-the baseline; this problem has one row per `civ_id` and no connected-entity
-groups, so the default `StratifiedKFold` is the correct, leakage-safe split and
-`--group-col` is omitted. `--time-col ref_ts` (account-creation time) enables the
-stability panel.
+- `--time-col ref_ts` enables the stability panel; **omit `--group-col`** (feeding
+  the `home_city` label to `GroupKFold` would hold out whole classes).
+- On Windows run the harness as `python -X utf8 …` (it writes an em-dash that
+  crashes cp1252).
+- Generated parquet (`data/tables/`, `features/feature_table.parquet`) is
+  gitignored — regenerable, deterministic (seed 11).

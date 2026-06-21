@@ -1,260 +1,308 @@
 #!/usr/bin/env python3
 """
-generate_data.py — synthetic "home-city" classification problem.
+generate_data.py — HARD node-classification problem: predict a person's
+`home_city` (50 cities, but GT on only 30) from the *text* they exchange, the
+communication graph, sparse documents about them, and messy auxiliary tables.
 
-Task: predict each civilian's home_city (5 imbalanced classes) from a
-communication graph + auxiliary tables. The data is deliberately HARD:
+What makes it hard / realistic:
+  - 50 cities grouped into 10 metros (5 each). Within-metro cities are
+    confusable "sisters"; a per-person home-affinity blurs ALL channels at once.
+  - GT exists for only 30 of the 50 cities, with a NORMAL-shaped (bell, heavily
+    imbalanced) label frequency + a floor; the other 20 cities' residents appear
+    only as unlabeled graph/text context. Partial coverage + ~5% label noise.
+  - The predictive signal lives mostly in TEXT: per-city flavor tokens, explicit
+    city mentions (a near-leak), and language. Most messages are generic noise.
+  - Messiness everywhere: nulls, duplicate edges/rows, inconsistent city casing &
+    typos, mixed-type columns, online merchants with null city.
+  - Three leak traps: per-person `ip_geo` (≈ the answer), per-region `weather`,
+    and self-reported `raw_city_text` (strong but messy near-leak).
 
-  - noisy homophily: only ~65% of a civilian's contacts share their city
-  - travelers (~12%): mobility/spend smeared across cities
-  - overlapping classes: language + behavior distributions overlap
-  - leakage traps: a per-region weather table that can only be joined to a
-    civilian *through their home region* (i.e. through the answer), and
-    near-leak strong location features (tower region, merchant city).
-
-Writes one parquet per table to data/tables/ and prints a one-line data
-dictionary (with a relevance tag) per table. Deterministic; runtime < 2 min.
+Writes one parquet per table to data/tables/ and prints a tagged data dictionary.
+Deterministic; runtime < ~90s.
 """
 
 import os
 import numpy as np
 import pandas as pd
 
-SEED = 7
+SEED = 11
 rng = np.random.default_rng(SEED)
 OUT = os.path.join(os.path.dirname(__file__), "tables")
 os.makedirs(OUT, exist_ok=True)
 
 # ---------------------------------------------------------------- topology ---
-N_CIV = 7000
-CITIES = ["city_A", "city_B", "city_C", "city_D", "city_E"]
-CITY_P = np.array([0.35, 0.25, 0.20, 0.12, 0.08])           # imbalanced
-REGION = {c: f"reg_{c[-1]}" for c in CITIES}                # 1:1 city<->region
-REGIONS = [REGION[c] for c in CITIES]
-# geographic centers (arbitrary lat/lon) per city
-CENTER = {c: (10 + 4 * i, -70 - 5 * i) for i, c in enumerate(CITIES)}
-# distinct base climate per region -> makes a region-joined weather feature a
-# near-deterministic proxy for the label (the trap).
-BASE_TEMP = dict(zip(REGIONS, [30.0, 22.0, 15.0, 8.0, 35.0]))
-BASE_PRECIP = dict(zip(REGIONS, [20.0, 90.0, 140.0, 60.0, 10.0]))
-# overlapping, only mildly city-correlated language mix (3 languages)
-LANGS = ["lang_x", "lang_y", "lang_z"]
-LANG_MIX = {
-    "city_A": [0.55, 0.30, 0.15], "city_B": [0.45, 0.35, 0.20],
-    "city_C": [0.40, 0.35, 0.25], "city_D": [0.35, 0.40, 0.25],
-    "city_E": [0.30, 0.40, 0.30],
-}
-# small per-city timezone offset (hours) -> a faint activity-hour signal
-TZ_OFFSET = dict(zip(CITIES, [0, 1, 2, 2, 3]))
-
-# Where off-city activity leaks (over OTHER cities). This is what makes the
-# problem HARD: instead of spreading by population, a civilian's non-home
-# contacts/pings/spend concentrate on a "sister" city -> A<->B and C<->D are
-# confusable, so no single feature decides them. E leaks broadly -> it stays
-# separable (its features will look near-leak-strong and get flagged).
-CONFUSE = {
-    "city_A": {"city_B": 0.70, "city_C": 0.12, "city_D": 0.10, "city_E": 0.08},
-    "city_B": {"city_A": 0.70, "city_C": 0.12, "city_D": 0.10, "city_E": 0.08},
-    "city_C": {"city_D": 0.68, "city_A": 0.15, "city_B": 0.12, "city_E": 0.05},
-    "city_D": {"city_C": 0.68, "city_A": 0.15, "city_B": 0.12, "city_E": 0.05},
-    "city_E": {"city_A": 0.35, "city_B": 0.27, "city_C": 0.22, "city_D": 0.16},
-}
-CONF_C = {c: list(d.keys()) for c, d in CONFUSE.items()}
-CONF_P = {c: np.array(list(d.values())) for c, d in CONFUSE.items()}
+N = 9000
+N_CITIES, METRO_SIZE = 50, 5
+CITIES = [f"city_{i:02d}" for i in range(N_CITIES)]
+METRO = {c: i // METRO_SIZE for i, c in enumerate(CITIES)}          # 10 metros
+REGIONS = [f"metro_{m}" for m in range(N_CITIES // METRO_SIZE)]
+CITY_REGION = {c: f"metro_{METRO[c]}" for c in CITIES}
+BASE_TEMP = {r: 6.0 + 2.7 * i for i, r in enumerate(REGIONS)}       # distinct climates
+BASE_PRECIP = {r: 30.0 + 11.0 * ((i * 7) % 10) for i, r in enumerate(REGIONS)}
+LANGS = [f"lang_{i}" for i in range(6)]
+# per-metro base language mix (overlapping); city perturbs it slightly
+METRO_LANG = {m: rng.dirichlet(np.ones(6) * 1.3) for m in range(10)}
 
 BASE_DATE = np.datetime64("2024-01-01")
-SPAN_DAYS = 540  # ~18 months of activity
+SPAN = 540
 
 
-def off_city(home, size):
-    """Sample `size` non-home cities for `home`, weighted toward its sister."""
-    return rng.choice(CONF_C[home], size=size, p=CONF_P[home])
-
-
-def rand_ts(n):
-    """Random timestamps over the activity window."""
-    offs = rng.integers(0, SPAN_DAYS * 24 * 3600, size=n)
-    return BASE_DATE + offs.astype("timedelta64[s]")
+def rand_ts(n, null_frac=0.0):
+    ts = BASE_DATE + rng.integers(0, SPAN * 86400, n).astype("timedelta64[s]")
+    out = pd.Series(ts)
+    if null_frac:
+        out[rng.random(n) < null_frac] = pd.NaT
+    return out
 
 
 def save(df, name, tag):
-    path = os.path.join(OUT, f"{name}.parquet")
-    df.to_parquet(path, index=False)
-    cols = ", ".join(df.columns)
-    print(f"[{tag:13}] {name:13} rows={len(df):>7,}  cols=({cols})")
+    df.to_parquet(os.path.join(OUT, f"{name}.parquet"), index=False)
+    print(f"[{tag:14}] {name:14} rows={len(df):>7,}  cols=({', '.join(df.columns)})")
 
 
-# ---------------------------------------------------------------- civilians ---
-civ_id = np.array([f"civ_{i:05d}" for i in range(N_CIV)])
-home_city = rng.choice(CITIES, size=N_CIV, p=CITY_P)
-is_traveler = rng.random(N_CIV) < 0.12                       # ~12% travelers
-# Per-civilian home affinity drives ALL channels (comms, towers, spend) together,
-# so a low-affinity ("border") civilian looks half-sister *everywhere* at once.
-# That makes the channels' noise correlated and the confusion irresolvable —
-# the real source of difficulty (independent per-channel noise would average out).
-base_homophily = np.clip(rng.normal(0.66, 0.18, N_CIV), 0.20, 0.92)
-base_homophily[is_traveler] *= 0.6                           # travelers roam most
+# ---------------------------------------------------------- labels & people ---
+labeled_cities = sorted(rng.choice(CITIES, size=30, replace=False))
+# normal-shaped counts across the 30 labeled cities, floored so 5-fold CV works
+rank = np.arange(30)
+wbell = np.exp(-((rank - 14.5) / 7.0) ** 2)
+counts = np.maximum(18, (wbell / wbell.sum() * 5200).round().astype(int))
+labeled_true = np.repeat(labeled_cities, counts)
+n_lab = len(labeled_true)
+n_unlab = N - n_lab
+# unlabeled residents over ALL 50 cities (so the 20 GT-less cities are populated)
+cw = np.exp(-((np.arange(N_CITIES) - 24.5) / 13.0) ** 2) + 0.25
+unlab_true = rng.choice(CITIES, size=n_unlab, p=cw / cw.sum())
+true_city = np.concatenate([labeled_true, unlab_true])
+is_labeled = np.concatenate([np.ones(n_lab, bool), np.zeros(n_unlab, bool)])
+order = rng.permutation(N)
+true_city, is_labeled = true_city[order], is_labeled[order]
+person_id = np.array([f"p_{i:05d}" for i in range(N)])
+true_idx = np.array([CITIES.index(c) for c in true_city])
 
-age = np.clip(rng.normal(38, 14, N_CIV), 18, 90).round().astype(int)
-created = rand_ts(N_CIV)
-device_type = rng.choice(["android", "ios", "kaios"], N_CIV, p=[0.6, 0.35, 0.05])
-language_pref = np.array([
-    rng.choice(LANGS, p=LANG_MIX[c]) for c in home_city
-])
+# observed label = true city, with ~5% noise to a same-metro sister that is ALSO
+# a labeled city (so GT stays confined to the 30 labeled cities).
+labeled_set = set(labeled_cities)
+home_obs = np.array(true_city, dtype=object)
+noise = is_labeled & (rng.random(N) < 0.05)
+for i in np.where(noise)[0]:
+    sis = [c for c in CITIES if METRO[c] == METRO[true_city[i]]
+           and c != true_city[i] and c in labeled_set]
+    if sis:
+        home_obs[i] = rng.choice(sis)
+home_obs[~is_labeled] = None
 
-civilians = pd.DataFrame(dict(
-    civ_id=civ_id, age=age, account_created_at=created,
-    device_type=device_type, language_pref=language_pref))
-save(civilians, "civilians", "WEAK/PARTIAL")
+# per-person home affinity: low = "border", blurs every channel toward sisters
+home_aff = np.clip(rng.normal(0.62, 0.20, N), 0.15, 0.95)
+is_traveler = rng.random(N) < 0.12
+home_aff[is_traveler] *= 0.6
 
-# LABEL — written separately, never to be used as a feature.
-save(pd.DataFrame(dict(civ_id=civ_id, home_city=home_city)), "home_city", "LABEL")
+# --------------------------------------------------------------- text vocab ---
+GENERIC = ("hey hi ok yeah lol thanks later tonight lunch coffee meeting work "
+           "tired busy sure maybe call text soon home tomorrow weekend game "
+           "dinner train bus rain sun cold market kids school deadline").split()
+JUNK = ["", "...", "??", " ", "asdf", "??!", "  "]
+EMOJI = ["", "", "", "", "\U0001F600", "\U0001F44D", "\U0001F525"]
 
-# ----------------------------------------------------------------- comms -----
-# Each edge: with prob rho a same-city callee; otherwise a callee in a
-# confusion-weighted OTHER city (mostly the home city's sister, via CONFUSE).
-# rho is lower for travelers. Noise is NOT population-spread, so sister cities
-# stay confusable -> the neighbor feature is strong but not decisive.
-N_EDGES = 60_000
-by_city = {c: np.where(home_city == c)[0] for c in CITIES}
-callers = rng.integers(0, N_CIV, N_EDGES)
-same_city = rng.random(N_EDGES) < base_homophily[callers]    # per-civ homophily
-caller_city = home_city[callers]
-callee_city = caller_city.copy()
-for c in CITIES:                                             # vectorized off-city draw
-    msk = (~same_city) & (caller_city == c)
-    if msk.any():
-        callee_city[msk] = off_city(c, int(msk.sum()))
-callees = np.array([by_city[cc][rng.integers(len(by_city[cc]))] for cc in callee_city])
-# drop self-loops
-keep = callers != callees
-callers, callees = callers[keep], callees[keep]
-m = len(callers)
-comms = pd.DataFrame(dict(
-    caller_id=civ_id[callers], callee_id=civ_id[callees], ts=rand_ts(m),
-    duration_s=np.clip(rng.exponential(120, m), 1, 3600).round().astype(int),
-    channel=rng.choice(["call", "sms"], m, p=[0.45, 0.55])))
-save(comms, "comms", "RELEVANT")
 
-# realized per-civilian homophily, for sanity (printed below).
+def flavor_tokens(c):
+    return [f"land_{c}", f"team_{c}", f"slang_{c}", f"dia_metro_{METRO[c]}"]
+
+
+def off_city(c):
+    """A confusable other city: usually a same-metro sister."""
+    if rng.random() < 0.7:
+        sis = [x for x in CITIES if METRO[x] == METRO[c] and x != c]
+        return rng.choice(sis)
+    return CITIES[rng.integers(N_CITIES)]
+
+
+def make_text(p):
+    """Build one message's text for person p (true city c), flavored + noisy."""
+    c = true_city[p]
+    L = int(rng.integers(4, 13))
+    toks = list(rng.choice(GENERIC, size=L))
+    if rng.random() < home_aff[p] * 0.5:                 # city-flavored tokens
+        src = c if rng.random() < home_aff[p] else off_city(c)
+        toks += list(rng.choice(flavor_tokens(src), size=rng.integers(1, 3)))
+    if rng.random() < 0.06:                              # explicit city mention (near-leak)
+        ment = c if rng.random() < 0.75 else off_city(c)
+        toks.append(f"cityname_{ment}")
+    if rng.random() < 0.15:
+        toks.append(rng.choice(["http://t.co/x", "www.site/q"]))  # url noise
+    toks.append(rng.choice(EMOJI))
+    toks.append(rng.choice(JUNK))
+    s = " ".join(t for t in toks if t)
+    return s if rng.random() > 0.04 else None            # ~4% null/empty text
+
+
+def person_lang(p):
+    base = METRO_LANG[METRO[true_city[p]]].copy()
+    return rng.choice(LANGS, p=base / base.sum())
+
+
+# ---------------------------------------------------------------- people -----
+age = rng.normal(38, 13, N)
+age[rng.random(N) < 0.05] = np.nan                       # messy: missing ages
+age = np.where(np.isnan(age), np.nan, np.clip(age, 16, 92))
+declared = np.array([None] * N, dtype=object)            # raw self-reported city (messy)
+for i in range(N):
+    r = rng.random()
+    if r < 0.30:
+        continue                                         # ~30% null
+    city = true_city[i] if rng.random() < 0.82 else off_city(true_city[i])
+    txt = city.replace("city_", "City ")                 # "City 07"
+    if rng.random() < 0.25:
+        txt = txt.upper()
+    if rng.random() < 0.15:
+        txt = "  " + txt + " "                            # stray whitespace
+    if rng.random() < 0.10:
+        txt = txt[:-1] + "x"                              # typo
+    declared[i] = txt
+people = pd.DataFrame(dict(
+    person_id=person_id, age=age,
+    signup_at=rand_ts(N, null_frac=0.03),
+    device=rng.choice(["android", "ios", "kaios", None], N, p=[0.55, 0.33, 0.07, 0.05]),
+    declared_language=[person_lang(i) for i in range(N)],
+    raw_city_text=declared))
+# messy: a few duplicate person rows
+dups = people.iloc[rng.choice(N, 60, replace=False)]
+people = pd.concat([people, dups], ignore_index=True)
+save(people, "people", "MIXED/MESSY")
+
+# LABEL — only labeled people; 30 cities; never a feature
+lab = pd.DataFrame(dict(person_id=person_id[is_labeled],
+                        home_city=home_obs[is_labeled].astype(str)))
+save(lab, "home_city", "LABEL")
+
+# ---------------------------------------------------------------- messages ---
+# graph edges biased by home affinity (same city) else a confusable sister;
+# each carries TEXT content + a language tag. The core signal + the graph.
+N_MSG = 78_000
+snd = rng.integers(0, N, N_MSG)
+same = rng.random(N_MSG) < home_aff[snd]
+by_city = {c: np.where(true_city == c)[0] for c in CITIES}
+rcv = np.empty(N_MSG, dtype=int)
+for e in range(N_MSG):
+    s = snd[e]
+    pool = by_city[true_city[s]] if same[e] else by_city[off_city(true_city[s])]
+    rcv[e] = pool[rng.integers(len(pool))] if len(pool) else rng.integers(N)
+keep = snd != rcv
+snd, rcv = snd[keep], rcv[keep]
+M = len(snd)
+messages = pd.DataFrame(dict(
+    sender_id=person_id[snd], recipient_id=person_id[rcv],
+    ts=rand_ts(M, null_frac=0.02),
+    text=[make_text(s) for s in snd],
+    lang=[person_lang(s) for s in snd],
+    channel=rng.choice(["chat", "sms", "email"], M, p=[0.6, 0.3, 0.1])))
+messages = pd.concat([messages, messages.iloc[rng.choice(M, 800, replace=False)]],
+                     ignore_index=True)                  # messy: duplicate messages
+save(messages, "messages", "RELEVANT/TEXT")
+
 contacts = {}
-for a, b in zip(callers, callees):
+for a, b in zip(snd, rcv):
     contacts.setdefault(a, []).append(b)
     contacts.setdefault(b, []).append(a)
 
-# ------------------------------------------------------------- towers/pings ---
-N_TOWERS = 220
-tower_city = rng.choice(CITIES, N_TOWERS, p=CITY_P)          # bigger city -> more towers
-# soft region: a tower mostly carries its city's region, sometimes a neighbor's
-tower_region = np.array([
-    REGION[tc] if rng.random() < 0.88 else REGION[rng.choice(CITIES)]
-    for tc in tower_city])
-tw_lat = np.array([CENTER[c][0] + rng.normal(0, 0.4) for c in tower_city])
-tw_lon = np.array([CENTER[c][1] + rng.normal(0, 0.4) for c in tower_city])
-tower_id = np.array([f"tw_{i:04d}" for i in range(N_TOWERS)])
-towers = pd.DataFrame(dict(
-    tower_id=tower_id, lat=tw_lat.round(4), lon=tw_lon.round(4),
-    region_code=tower_region))
-save(towers, "towers", "DIM")
+# ------------------------------------------------------------- person_docs ---
+# Sparse free-text documents ABOUT people (~25% coverage): bios/reports.
+doc_ids, doc_txt = [], []
+for i in range(N):
+    if rng.random() > 0.25:
+        continue
+    c = true_city[i]
+    body = list(rng.choice(GENERIC, size=rng.integers(8, 20)))
+    body += list(rng.choice(flavor_tokens(c if rng.random() < home_aff[i] else off_city(c)),
+                            size=rng.integers(1, 4)))
+    if rng.random() < 0.20:
+        body.append(f"cityname_{c}")                     # doc sometimes names the city
+    doc_ids.append(person_id[i]); doc_txt.append("report: " + " ".join(body))
+save(pd.DataFrame(dict(person_id=doc_ids, doc_text=doc_txt)), "person_docs", "RELEVANT/TEXT")
 
-tw_by_city = {c: np.where(tower_city == c)[0] for c in CITIES}
-ping_civ, ping_tw = [], []
-for i in range(N_CIV):
-    n = rng.integers(8, 16)
-    hc = home_city[i]
-    # ping home-share scales with the civ's affinity (towers a touch stronger
-    # than comms); border/traveler civs ping the sister region just as often.
-    p_home = min(0.95, base_homophily[i] * 1.15)
-    chosen = np.where(rng.random(n) < p_home, hc, off_city(hc, n))
-    for c in chosen:
-        pool = tw_by_city[c] if len(tw_by_city[c]) else tw_by_city[hc]
-        ping_tw.append(tower_id[pool[rng.integers(len(pool))]])
-        ping_civ.append(civ_id[i])
-tower_pings = pd.DataFrame(dict(
-    civ_id=ping_civ, tower_id=ping_tw, ts=rand_ts(len(ping_civ))))
-save(tower_pings, "tower_pings", "RELEVANT-STRONG")
+# ------------------------------------------------------------- towers/pings ---
+N_TOWERS = 400
+tw_city = rng.choice(CITIES, N_TOWERS)
+tw_region = np.array([CITY_REGION[c] if rng.random() < 0.85
+                      else rng.choice(REGIONS) for c in tw_city])
+tower_id = np.array([f"tw_{i:04d}" for i in range(N_TOWERS)])
+save(pd.DataFrame(dict(tower_id=tower_id, region_code=tw_region,
+                       lat=(10 + rng.random(N_TOWERS) * 40).round(4),
+                       lon=(-90 + rng.random(N_TOWERS) * 30).round(4))), "towers", "DIM")
+tw_by_region = {r: np.where(tw_region == r)[0] for r in REGIONS}
+pc, pt = [], []
+for i in range(N):
+    n = rng.integers(5, 14)
+    for _ in range(n):
+        reg = CITY_REGION[true_city[i]] if rng.random() < min(0.95, home_aff[i] * 1.2) \
+            else CITY_REGION[off_city(true_city[i])]
+        pool = tw_by_region[reg] if len(tw_by_region[reg]) else range(N_TOWERS)
+        pt.append(tower_id[pool[rng.integers(len(pool))]]); pc.append(person_id[i])
+save(pd.DataFrame(dict(person_id=pc, tower_id=pt, ts=rand_ts(len(pc))),
+                  ), "tower_pings", "RELEVANT")
 
 # ------------------------------------------------------ merchants/transactions
-N_MERCH = 450
-is_online = rng.random(N_MERCH) < 0.20
-merch_city = np.array([
-    None if is_online[j] else rng.choice(CITIES, p=CITY_P) for j in range(N_MERCH)])
-merch_id = np.array([f"mch_{i:04d}" for i in range(N_MERCH)])
-merchants = pd.DataFrame(dict(
-    merchant_id=merch_id, merchant_city=merch_city,
-    category=rng.choice(["grocery", "fuel", "retail", "food", "transit"], N_MERCH),
-    is_online=is_online))
-save(merchants, "merchants", "DIM")
-
-mch_by_city = {c: np.where(merch_city == c)[0] for c in CITIES}
-mch_online = np.where(is_online)[0]
-tx_civ, tx_mch, tx_amt = [], [], []
-for i in range(N_CIV):
-    n = rng.integers(5, 22)
-    hc = home_city[i]
-    p_home = min(0.90, base_homophily[i] * 0.95)   # noisier location cue than towers
-    for _ in range(n):
-        if rng.random() < 0.15:                              # online (null city)
-            j = mch_online[rng.integers(len(mch_online))]
+N_MERCH = 700
+m_online = rng.random(N_MERCH) < 0.22
+m_city = np.array([None if m_online[j] else rng.choice(CITIES) for j in range(N_MERCH)])
+# messy: inconsistent casing / whitespace on merchant_city
+m_city_msgy = np.array([None if v is None else
+                        (v.upper() if rng.random() < 0.3 else
+                         (" " + v if rng.random() < 0.3 else v)) for v in m_city], dtype=object)
+mid = np.array([f"m_{i:04d}" for i in range(N_MERCH)])
+save(pd.DataFrame(dict(merchant_id=mid, merchant_city=m_city_msgy,
+                       category=rng.choice(["grocery", "fuel", "food", "retail", "transit"], N_MERCH),
+                       is_online=m_online)), "merchants", "DIM")
+m_by_city = {c: np.where(m_city == c)[0] for c in CITIES}
+m_online_idx = np.where(m_online)[0]
+tc, tm = [], []
+for i in range(N):
+    for _ in range(rng.integers(3, 18)):
+        if rng.random() < 0.15:
+            j = m_online_idx[rng.integers(len(m_online_idx))]
         else:
-            cc = hc if rng.random() < p_home else off_city(hc, 1)[0]
-            pool = mch_by_city[cc] if len(mch_by_city[cc]) else mch_online
+            cc = true_city[i] if rng.random() < min(0.9, home_aff[i]) else off_city(true_city[i])
+            pool = m_by_city[cc] if len(m_by_city[cc]) else m_online_idx
             j = pool[rng.integers(len(pool))]
-        tx_civ.append(civ_id[i]); tx_mch.append(merch_id[j])
-        tx_amt.append(round(float(rng.lognormal(3.0, 0.8)), 2))
-transactions = pd.DataFrame(dict(
-    civ_id=tx_civ, merchant_id=tx_mch, amount=tx_amt, ts=rand_ts(len(tx_civ))))
-save(transactions, "transactions", "PARTIAL")
+        tc.append(person_id[i]); tm.append(mid[j])
+save(pd.DataFrame(dict(person_id=tc, merchant_id=tm,
+                       amount=np.round(rng.lognormal(3, 0.8, len(tc)), 2),
+                       ts=rand_ts(len(tc)))), "transactions", "PARTIAL")
 
-# ------------------------------------------------------------- app_events ----
-# Only signal is activity-hour (a faint timezone proxy); event_type is noise.
-ev_civ, ev_type, ev_ts = [], [], []
-ev_types = ["open", "scroll", "search", "notif_open", "share"]
-for i in range(N_CIV):
-    n = rng.integers(10, 40)
-    # a city-independent personal schedule dominates; the per-city timezone
-    # offset is only a faint shift on top -> activity-hour is a weak location cue.
-    personal = rng.normal(13, 5)
-    base_hour = rng.normal(personal + TZ_OFFSET[home_city[i]], 2.5, n) % 24
-    day = rng.integers(0, SPAN_DAYS, n)
-    ts = BASE_DATE + (day * 24 * 3600 + (base_hour * 3600).astype(int)).astype("timedelta64[s]")
-    ev_civ.extend([civ_id[i]] * n)
-    ev_type.extend(rng.choice(ev_types, n))
-    ev_ts.extend(ts)
-app_events = pd.DataFrame(dict(civ_id=ev_civ, event_type=ev_type, ts=ev_ts))
-save(app_events, "app_events", "WEAK/RED-HERRING")
+# ------------------------------------------------------------- app/device ----
+ec, et = [], []
+for i in range(N):
+    n = rng.integers(8, 30)
+    ec.extend([person_id[i]] * n)
+    et.extend(rng.choice(["open", "scroll", "search", "share", "notif"], n))
+save(pd.DataFrame(dict(person_id=ec, event_type=et, ts=rand_ts(len(ec)))),
+     "app_events", "RED-HERRING")
+save(pd.DataFrame(dict(person_id=person_id,
+                       os_version=rng.choice(["12", "13", "14", "15", "16"], N),
+                       screen_in=np.round(np.clip(rng.normal(6.1, 0.6, N), 4, 7.9), 2),
+                       battery=rng.integers(55, 101, N))), "device_info", "RED-HERRING")
 
-# ------------------------------------------------------------- device_info ---
-# Pure distractor: no location signal at all.
-device_info = pd.DataFrame(dict(
-    civ_id=civ_id,
-    os_version=rng.choice(["12.1", "13.0", "14.2", "15.1", "16.0"], N_CIV),
-    screen_size_in=np.clip(rng.normal(6.1, 0.6, N_CIV), 4.0, 7.8).round(2),
-    battery_health=rng.integers(60, 101, N_CIV)))
-save(device_info, "device_info", "RED-HERRING")
-
-# ------------------------------------------------------------- weather_logs --
-# TRAP: keyed by region_code+date, NOT by civilian. Joining it to a civilian
-# requires their region — i.e. the answer. Distinct per-region climate makes the
-# (leaky) region-joined feature a near-perfect label proxy.
-dates = pd.date_range("2024-01-01", periods=SPAN_DAYS, freq="D")
-doy = dates.dayofyear.to_numpy()
-season = 6.0 * np.sin(2 * np.pi * (doy - 80) / 365.0)        # shared seasonal swing
-rows = []
-for reg in REGIONS:
-    temp = BASE_TEMP[reg] + season + rng.normal(0, 1.0, SPAN_DAYS)
-    precip = np.clip(BASE_PRECIP[reg] + rng.normal(0, 15, SPAN_DAYS), 0, None)
-    rows.append(pd.DataFrame(dict(region_code=reg, date=dates,
-                                  temp_c=temp.round(2), precip_mm=precip.round(1))))
-weather_logs = pd.concat(rows, ignore_index=True)
-save(weather_logs, "weather_logs", "TRAP")
+# ------------------------------------------------------------- leak traps -----
+# weather: per region+date (TRAP — joinable to a person only via their region).
+dates = pd.date_range("2024-01-01", periods=SPAN, freq="D")
+season = 6 * np.sin(2 * np.pi * (dates.dayofyear - 80) / 365.0)
+wx = [pd.DataFrame(dict(region_code=r, date=dates,
+                        temp_c=(BASE_TEMP[r] + season + rng.normal(0, 1, SPAN)).round(2),
+                        precip_mm=np.clip(BASE_PRECIP[r] + rng.normal(0, 14, SPAN), 0, None).round(1)))
+      for r in REGIONS]
+save(pd.concat(wx, ignore_index=True), "weather_logs", "TRAP/LEAK")
+# ip_geo: per-person last-seen IP city (TRAP — basically the answer, ~88% exact)
+ip_city = np.array([true_city[i] if rng.random() < 0.88 else CITIES[rng.integers(N_CITIES)]
+                    for i in range(N)], dtype=object)
+ip_city[rng.random(N) < 0.08] = None                     # messy nulls
+save(pd.DataFrame(dict(person_id=person_id, ip_city=ip_city,
+                       ip_asn=rng.integers(1000, 9999, N))), "ip_geo", "TRAP/LEAK")
 
 # ----------------------------------------------------------------- sanity ----
-homo = np.mean([
-    np.mean(home_city[contacts[i]] == home_city[i])
-    for i in range(N_CIV) if i in contacts])
-print(f"\nrealized mean per-civilian comm homophily: {homo:.2%}  "
-      f"(travelers={is_traveler.mean():.1%})")
-print(f"class balance: " + ", ".join(
-    f"{c}={np.mean(home_city==c):.0%}" for c in CITIES))
-print(f"wrote 10 tables to {OUT}")
+homo = np.mean([np.mean(true_city[contacts[i]] == true_city[i])
+                for i in range(N) if i in contacts])
+lc = pd.Series(home_obs[is_labeled]).value_counts()
+print(f"\npeople={N:,}  labeled={is_labeled.sum():,} over {lc.size} cities "
+      f"(of {N_CITIES})  ·  unlabeled context={(~is_labeled).sum():,}")
+print(f"label counts: max={lc.max()} min={lc.min()} median={int(lc.median())} (normal-shaped)")
+print(f"realized comm homophily (same-city contacts): {homo:.1%}")
+print(f"wrote 13 tables to {OUT}")

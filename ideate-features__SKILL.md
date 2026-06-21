@@ -23,8 +23,11 @@ Principle: entity class = fingerprint. Favor structural role, behavioral *shape*
 1. **Get + profile.** From the user: table names, entity + classes, prediction
    cutoff. Then run (never pull full tables to pandas):
    `python "${CLAUDE_SKILL_DIR}/scripts/profile_spark_tables.py" T1 T2 ... --keys --remote sc://HOST:PORT`
+   where each T is a catalog table (`matcha.t1`) OR a path on HDFS / S3 / S3A /
+   GCS / DBFS (`s3://bucket/t1`, `hdfs://…`, `/lake/t1/*.parquet`); the format is
+   inferred from the extension or set with `--format`.
    (or set SPARK_REMOTE; if no session it prints a notebook cell — use that.)
-   For local files (parquet/csv) instead of catalog tables, use `scripts/inspect_tables.py PATH` (pandas).
+   For purely local files (parquet/csv), use `scripts/inspect_tables.py PATH` (pandas).
 
 2. **Infer + CONFIRM.** State back, and get a yes before ideating: which table is
    edges / entities / labels; the join keys (edge keys often differ from the

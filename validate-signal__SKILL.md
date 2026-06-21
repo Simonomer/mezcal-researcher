@@ -1,56 +1,63 @@
 ---
 name: validate-signal
 description: >-
-  Score materialized candidate features for real signal about a multiclass label
-  and write a markdown report with charts. Trigger whenever the user has a built
+  Score materialized candidate features for real signal about a multiclass
+  label, then write a markdown report with charts. Trigger when the user has a
   feature table + labels and asks which features carry signal, "is this feature
-  any good", "screen/validate my features", "keep or drop", or has just
-  materialized a backlog from ideate-features. Runs a deterministic harness
-  (permutation null, effect size, baseline-model importance, time stability) all
-  under leakage-safe splits. Screening only — not final model evaluation.
+  any good", "keep or drop", or just materialized a backlog from
+  ideate-features. Screening only — not final model evaluation.
 ---
 
 # validate-signal
 
-Output: `validation/report.md` + `validation/figures/*.png` — per-feature table
-(MI, permutation-null, beats-null, best one-vs-rest AUC, baseline importance,
-coverage, time stability) with a keep / investigate / drop call and reasons,
-plus baseline macro-F1/AUC and a confusion matrix.
+Screen features for signal about a multiclass label. The script does ALL the
+statistics under leakage-safe splits — do not compute metrics yourself.
 
-Signal = beats a shuffled-label null (not chance) + effect size + adds value in a
-model that has the other features (incremental) + stable across folds/time. No
-single number is trusted; the script layers all of these. Screening only — the
-final word is full-model out-of-sample performance.
+Signal = beats a shuffled-label null + effect size (MI / best one-vs-rest AUC) +
+adds value in a baseline model that has the other features (incremental) + stable
+across folds/time. No single number is trusted.
+
+Leakage-safe by construction: train-only neighbor labels via out-of-fold
+(`cross_val_predict` over StratifiedKFold, or GroupKFold with `--group-col`); a
+time fence via `--time-col` (stability across time slices); the label column is
+never feature-ized. Discrete columns are used as NATIVE categorical features in
+the baseline model.
 
 ## Steps
 
-1. **Get inputs.** Feature table + label table. Spark `--features-table` /
-   `--labels-table` accept a catalog table (`matcha.feat`) OR a path on HDFS /
-   S3 / S3A / GCS / DBFS (`s3://bucket/feat`, `hdfs://…`, `/lake/feat/*.parquet`;
-   `--format` to override). Or local `--features-file` / `--labels-file`. Plus
-   `--id-col`, `--label-col`, and if available `--time-col` (stability) and
-   `--group-col` (grouped CV, e.g. entity/connected groups).
+1. **Collect inputs.** Need a feature source, a label source, plus `--id-col`
+   and `--label-col` (both required). Add `--time-col` for time stability and
+   `--group-col` for grouped CV when available.
+   - Tables/paths: `--features-table` / `--labels-table` accept a catalog table
+     (`matcha.feat`) OR a path on HDFS / S3 / S3A / GCS / DBFS
+     (`s3://bucket/feat`, `hdfs://...`, `/lake/feat/*.parquet`). Use `--format`
+     to override the read format. Set the Spark endpoint via `--remote
+     sc://HOST:PORT` (or the `SPARK_REMOTE` env var / an active session).
+   - Local files: `--features-file` / `--labels-file`.
 
-2. **Run the harness** (it does all the statistics — do not compute metrics
-   yourself):
+2. **Run the harness:**
    ```bash
    python "${CLAUDE_SKILL_DIR}/scripts/signal_panel.py" \
-       --features-table T_FEAT --labels-table T_LAB \   # tables OR s3://… / hdfs://… paths
-       --id-col ID --label-col LABEL [--time-col TS] [--group-col GID] \
-       [--remote sc://HOST:PORT] [--format parquet] --out validation/report.md
+       --features-table T_FEAT --labels-table T_LAB \
+       --id-col ID --label-col LABEL \
+       [--features-file F.parquet --labels-file L.parquet] \
+       [--time-col TS] [--group-col GID] \
+       [--remote sc://HOST:PORT] [--format parquet] \
+       [--features COL1 COL2] [--sample 200000] [--perm 30] \
+       --out validation/report.md
    ```
-   Over Spark Connect it samples + joins as DataFrame ops, pulls a stratified
-   sample to the driver for the sklearn/scipy metrics. Discrete columns are used
-   as NATIVE categorical features in the baseline model (ids / text-derived
-   categories, not arbitrary codes).
+   Output: `validation/report.md` + `validation/figures/*.png` (figures dir is
+   derived from `--out`; there is no `--figdir` flag). The report is a per-feature
+   keep / investigate / drop table with reasons, plus baseline macro-F1/AUC and a
+   confusion matrix.
 
-3. **Summarize for the user.** Read `validation/report.md`. Report keep /
-   investigate / drop counts, the baseline macro-F1/AUC, and call out: features
-   that didn't beat the null (noise), redundant pairs, unstable-over-time
-   features, and any "suspiciously strong" feature — flag to investigate, not
-   celebrate. Two leak detectors: high one-vs-rest **AUC** (numeric) and high
-   **mi_ratio** = MI ÷ label-entropy (catches near-deterministic *categorical*
-   leaks like an id/self-report column that nearly equals the label).
+3. **Summarize.** Read `validation/report.md`. Report keep / investigate / drop
+   counts, baseline macro-F1/AUC, and the two leak flags:
+   - one-vs-rest **AUC > 0.97** (numeric) -> investigate: suspiciously strong.
+   - **mi_ratio** = MI ÷ label-entropy **> 0.80** (categorical) -> investigate:
+     explains most of the label (near-deterministic id/self-report leak).
+   If a feature is flagged, say investigate — do not celebrate it.
 
-Screening only. Feed the kept features into the model; loop the dropped/weak ones
-back to ideate-features for a fresh batch.
+4. **Hand off.** Screening only — the final word is full-model out-of-sample
+   performance. Feed the KEPT features into the model. Loop the dropped/weak ones
+   back to ideate-features for a fresh batch.

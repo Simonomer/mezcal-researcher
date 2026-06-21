@@ -22,51 +22,72 @@ duplicate rows/edges, inconsistent city casing/typos, mixed types — plus three
 leak traps (`ip_geo` ≈ the answer, self-reported `raw_city_text`, region-joined
 `weather`).
 
-## How to run it
+## How to use it
 
-Same loop everywhere — **profile → ideate → materialize → validate → (loop back)**.
+In normal use you type **two chat prompts** in Claude Code — the skills run their
+scripts for you and hand back the report. You don't type python; the human only
+**confirms the wiring** and **sets the keep threshold**. The loop:
+**ideate → materialize → validate → (loop back)**.
 
-### A. Real world: your Spark tables (catalog, HDFS, or S3)
+### Setup (once)
 
-The skills read a catalog table **or** a path on HDFS / S3 / S3A / GCS / DBFS;
-heavy work stays on the cluster, only a bounded sample reaches the driver.
+Install the two skills so `/ideate-features` and `/validate-signal` become real
+commands (they live as `*__SKILL.md` files in this repo's root):
 
 ```bash
-pip install "pyspark[connect]" pandas scikit-learn scipy matplotlib pyarrow
-export SPARK_REMOTE=sc://YOUR-HOST:15002          # your Spark Connect endpoint
+mkdir -p ~/.claude/skills/ideate-features/scripts ~/.claude/skills/validate-signal/scripts
+cp ideate-features__SKILL.md  ~/.claude/skills/ideate-features/SKILL.md
+cp scripts/inspect_tables.py scripts/profile_spark_tables.py ~/.claude/skills/ideate-features/scripts/
+cp validate-signal__SKILL.md ~/.claude/skills/validate-signal/SKILL.md
+cp scripts/signal_panel.py   ~/.claude/skills/validate-signal/scripts/
 
-# 1. Ideate — profile catalog tables OR paths, confirm wiring, get the backlog
-python scripts/profile_spark_tables.py warehouse.messages warehouse.people \
-    warehouse.home_city warehouse.tower_pings ... --keys          # or s3://bucket/messages …
-
-# 2. Materialize on the cluster (text extraction, OOF neighbor) -> a feature table
-SOURCE=warehouse python features/build_features_spark.py          # SOURCE may be s3://bucket/db
-
-# 3. Validate — joins cluster-side, stratified sample to the driver
-python scripts/signal_panel.py \
-    --features-table warehouse.home_city_features --labels-table warehouse.home_city \
-    --id-col person_id --label-col home_city --perm 25 --out validation/report.md
-#   --features-table also accepts s3://… / hdfs://… paths (--format to override)
+pip install pandas scikit-learn scipy matplotlib pyarrow      # + "pyspark[connect]" for Spark
+export SPARK_REMOTE=sc://YOUR-HOST:15002                       # Spark only: your Connect endpoint
 ```
+
+### Use it — just chat
+
+**1 · Ideate** — point it at your tables (catalog names, or `s3://…` / `hdfs://…` paths):
+
+> `/ideate-features predict home_city for person_id; tables warehouse.messages warehouse.people warehouse.home_city warehouse.tower_pings …`
+
+Claude profiles them on a cluster-side sample, proposes the wiring, **you confirm**, and it writes the backlog.
+
+**2 · Materialize** — there is no skill for this (the feature logic is specific to *your* tables), so just ask:
+
+> `materialize the kept backlog rows into a feature table`
+
+Claude writes and runs the feature code — **you review the leakage-safe parts** — and writes a feature table to the catalog / S3 / HDFS (Spark) or local parquet. [`build_features_spark.py`](features/build_features_spark.py) is the template.
+
+**3 · Validate** — screen it:
+
+> `/validate-signal screen warehouse.home_city_features vs warehouse.home_city — id person_id, label home_city`
+
+Claude runs the harness and hands you **`validation/report.md`** + `validation/figures/` (the analysis lands wherever `--out` points; on Spark it's written to the driver, not back to S3/HDFS).
+
+The human is at **two gates only**: confirm the wiring (step 1) and set the keep threshold / rule on the flagged features (step 3).
 
 > **In-notebook (non-Connect) `spark`?** A script Claude launches is a separate
 > process and can't attach to your kernel's session — expose a Spark Connect
 > endpoint, or run the profiler's emitted cell in your notebook and `saveAsTable`
 > the feature/label tables so the harness can read them.
 
-### B. The reproducible demo in this repo (local, no cluster)
+<details>
+<summary><b>Reproduce the bundled demo without installing the skills (raw scripts)</b></summary>
+
+The skills just run these for you. `generate_data.py` is demo scaffolding only —
+in real use your tables already exist, so you start at *ideate*.
 
 ```bash
 pip install pandas numpy scikit-learn scipy matplotlib pyarrow
-python data/generate_data.py                          # 13 messy tables -> data/tables/
-python scripts/inspect_tables.py data/tables          # profile (grounds ideation)
-python features/build_features.py                     # -> features/feature_table.parquet (41 feats)
-python -X utf8 scripts/signal_panel.py \              # screen (─X utf8: Windows console)
-  --features-file features/feature_table.parquet \
-  --labels-file data/tables/home_city.parquet \
-  --id-col person_id --label-col home_city --time-col ref_ts --perm 25 \
-  --out validation/report.md
+python data/generate_data.py                          # 13 messy demo tables -> data/tables/
+python scripts/inspect_tables.py data/tables          # profile  (what /ideate-features runs)
+python features/build_features.py                     # materialize -> features/feature_table.parquet
+python -X utf8 scripts/signal_panel.py \              # screen   (what /validate-signal runs)
+  --features-file features/feature_table.parquet --labels-file data/tables/home_city.parquet \
+  --id-col person_id --label-col home_city --time-col ref_ts --perm 25 --out validation/report.md
 ```
+</details>
 
 ## Results
 
@@ -113,10 +134,12 @@ See [`validation/report.md`](validation/report.md) and
 | [`validation/report.md`](validation/report.md) | per-feature signal report + figures |
 | [`article/`](article) | the method article (markdown + landscape PDF) |
 
-## Notes on the validation command
+## Notes (mostly relevant only if you run the harness directly)
 
-- `--time-col ref_ts` enables the stability panel; **omit `--group-col`** (feeding
-  the `home_city` label to `GroupKFold` would hold out whole classes).
+`/validate-signal` handles these for you; they matter if you bypass the skill:
+
+- Pass `--time-col ref_ts` for the stability panel, and **omit `--group-col`**
+  (feeding the `home_city` label to `GroupKFold` would hold out whole classes).
 - On Windows run the harness as `python -X utf8 …` (it writes an em-dash that
   crashes cp1252).
 - Generated parquet (`data/tables/`, `features/feature_table.parquet`) is

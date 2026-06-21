@@ -47,11 +47,15 @@ export SPARK_REMOTE=sc://YOUR-HOST:15002                       # Spark only: you
 
 ### The workflow
 
-**1 · Ideate** — point the skill at your tables (catalog names, or `s3://…` / `hdfs://…` paths):
+**1 · Ideate** — point the skill at your tables. Use catalog names:
 
-> `/ideate-features predict home_city for person_id; tables warehouse.messages warehouse.people warehouse.home_city warehouse.tower_pings …`
+> `/ideate-features predict home_city for person_id; tables warehouse.messages warehouse.people warehouse.home_city warehouse.tower_pings … — Spark Connect at sc://my-host:15002`
 
-Claude profiles them on a cluster-side sample, proposes the wiring for your confirmation, then writes the backlog.
+…or HDFS / S3 paths instead of a catalog:
+
+> `/ideate-features predict home_city for person_id from s3://lake/telco/messages s3://lake/telco/people s3://lake/telco/home_city hdfs:///telco/tower_pings … — no time cutoff`
+
+Claude profiles them on a 100k-row cluster-side sample (no full pull), proposes the wiring for your confirmation, then writes the backlog. Set the endpoint once with `export SPARK_REMOTE=sc://my-host:15002` to omit it from the prompt; a live Connect session needs no URL at all.
 
 **2 · Materialize** — this step has no dedicated skill, since the feature logic is specific to your tables. Ask Claude to build it:
 

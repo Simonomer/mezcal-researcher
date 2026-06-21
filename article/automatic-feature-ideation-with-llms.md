@@ -95,6 +95,15 @@ tower/merchant aggregates and the deliberately leaky weather join (region annual
 mean temperature, attached through the civilian's true home region) are built on
 purpose — so the screen has something real to catch.
 
+**In practice this runs on Spark, not pandas.** The local parquet here buys
+one-command reproducibility; against a real warehouse the identical loop profiles
+*catalog tables* on a bounded cluster-side sample, materializes the feature table
+with distributed joins written back to the catalog (the
+[`build_features_spark.py`](https://github.com/Simonomer/mezcal-researcher/blob/main/features/build_features_spark.py)
+counterpart), and screens it over Spark Connect — pulling only a stratified sample
+to the driver for the statistics. The backlog's scale tags (node-aggregate vs.
+graph-centrality vs. sampled-embedding) exist precisely to keep that step cheap.
+
 ### What the screen found
 
 Run on the full 44-feature table, the harness reports a baseline **macro-F1 =
